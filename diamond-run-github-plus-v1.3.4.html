@@ -1,0 +1,3488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1, user-scalable=no" />
+<title>Diamond Run — GitHub+ v1.3.4</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: #0f1119;
+    min-height: 100vh;
+  }
+  #diamond-run-root {
+    min-height: 100vh;
+  }
+</style>
+</head>
+<body>
+<div id="diamond-run-root"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+<script>
+// DIAMOND RUN — GITHUB+ v1.3.4 PLAYTEST BUILD
+// Built directly on the original GitHub engine.
+// Core cascade / match resolver intentionally preserved.
+const {
+  useState,
+  useCallback,
+  useRef,
+  useEffect,
+  useLayoutEffect
+} = React;
+
+// ---- Config ----
+const ROWS = 10;
+const COLS = 10;
+const GEM_NAMES = ["Red","Green","Blue","Yellow","Purple"];
+const GEMS = [{
+  color: "#ff5c7a",
+  shape: "flame"
+}, {
+  color: "#6fe28d",
+  shape: "leaf"
+}, {
+  color: "#4db8ff",
+  shape: "drop"
+}, {
+  color: "#ffd34f",
+  shape: "star"
+}, {
+  color: "#b06cff",
+  shape: "gem"
+}];
+const SAVE_KEY = "diamondRunSave.v1"; // localStorage key — resumes progress on this device/browser only
+const WELCOME_SEEN_KEY = "diamondRunWelcomeSeen.v1";
+const CARRY_START_LEVEL = 31;
+const MOVES_DECADE_STEP = 10; // base starting moves drop by this much...
+const MOVES_DECADE_INTERVAL = 10; // ...every this many levels past 31
+const MOVES_FLOOR = 20; // base starting moves never go below this
+const CARRY_CAP_BASE = 10;
+const CARRY_CAP_STEP = 0; // carry-over cap drops by this much...
+const CARRY_CAP_INTERVAL = 1; // ...every this many levels past 31
+const CARRY_CAP_FLOOR = 10;
+const POWERUP_COSTS = {
+  G: 2,
+  arrow: 4,
+  T: 6,
+  R: 10
+}; // excess moves needed per power-up
+const MAX_HEAT_POWERUPS = 5; // heat-to-powerup conversion never seeds more than this many pieces
+const HEAT_START_LEVEL = 21; // the heat meter doesn't begin tracking until this level
+const DIFFICULTY_CYCLE_LENGTH = 20;
+const MAX_LEVEL = 200; // difficulty ramps easy→hardest across a 20-level cycle, then resets
+const DIFFICULTY_CYCLE_ESCALATION_RATE = 0.5; // each successive cycle ramps steeper, so its "hardest" tops the last
+const DIFFICULTY_CYCLE_CAP = 10; // stop escalating across cycles after this many repeats (long-run safety)
+const FILLER_WEIGHT = 12;
+// v1.2: objective quotas no longer directly become refill weights.
+// This prevents large calibrated objectives from creating runaway cascade floods.
+const BONUS_POINTS_PER_GEM = 1000;
+const SCORE_OBJECTIVE_LEVEL_INTERVAL = 3; // every 3rd level also requires a minimum score
+const SCORE_OBJECTIVE_BASE = 100000;
+const SCORE_OBJECTIVE_GROWTH = 16000;
+const SCARCITY_LEVEL_INTERVAL = 4; // every 4th level, the rarest color is exact-count on the board
+const FOCUS_LEVEL_INTERVAL = 7; // every 7th level, one color dominates the board
+const CHECKPOINT_INTERVAL = 10; // progress is saved every 10 levels
+const GRID_GAP = 4;
+const GRID_PAD = 10;
+const ICE_HITS = 1;
+const GRASS_HITS = 2;
+const WALL_HITS = 3;
+const OBSTACLE_LEVEL_INTERVAL = 6; // every 6th level introduces ice, walls, or grass
+const OIL_DROP_BONUS_MOVES = 2;
+const OIL_DROP_BONUS_SCORE = 500;
+const BONUS_LEVEL_INTERVAL = 5;
+const TIMED_COLOR_SECONDS = 180; // 3 minutes, per your "get 2000 yellow in 3 minutes" example
+const OIL_RUSH_SECONDS = 180; // time limit for the "clear N oil drops" bonus level type
+const OIL_RUSH_BASE_COUNT = 5;
+const COLOR_RUSH_MIN_SECONDS = 60;
+const GRAVITY_SHIFT_MOVE_LIMIT = 10;
+
+const LIGHT_SCRIPTURES = [
+  { reference:"John 1:5", text:"The light shines in the darkness. But the darkness has not overcome the light." },
+  { reference:"John 8:12", text:"I am the light of the world." },
+  { reference:"Matthew 5:14", text:"You are the light of the world." },
+  { reference:"Psalm 27:1", text:"The Lord is my light, and he saves me." },
+  { reference:"1 John 1:5", text:"God is light. There is no darkness in him at all." },
+  { reference:"Ephesians 5:8", text:"Live like children of the light." },
+  { reference:"Psalm 119:105", text:"It is like a light that guides me." },
+  { reference:"Isaiah 60:1", text:"Shine, because your light has come." },
+  { reference:"2 Corinthians 4:6", text:"Let light shine out of darkness." },
+  { reference:"Proverbs 4:18", text:"It shines brighter and brighter until the full light of day." }
+];
+function lightScriptureForLevel(level) {
+  const occurrence = Math.max(0, Math.floor((level - 10) / DIFFICULTY_CYCLE_LENGTH));
+  return LIGHT_SCRIPTURES[occurrence % LIGHT_SCRIPTURES.length];
+}
+
+
+// Levels 1–30: move counts vary (not a strict curve) between 25 and 40.
+// From level 31 on, base starting moves step down by decade block (40 for
+// 31-40, 30 for 41-50, 20 for 51-60 and onward — 20 is the permanent floor).
+// Leftover moves separately carry over into the next level's total, capped by
+// a declining ceiling (see carryCapForLevel) — excess beyond that cap
+// converts to bonus rainbow gems instead of being lost.
+function baseMovesForLevel(level) {
+  if (level === 31) return 40;                         // transition level
+  if (level >= 32) return 15 + Math.floor(Math.random() * 11); // 15..25
+  return 25 + Math.floor(Math.random() * 16);          // original 1..30 feel
+}
+
+// The carry-over cap for moves finishing on `level` (carrying into level+1).
+// 40 for levels 31-33, then drops by 5 every 3 levels, flooring at 10.
+function carryCapForLevel(level) {
+  if (level < CARRY_START_LEVEL) return 0;
+  return 10;
+}
+function checkpointFor(level) {
+  if (level <= CHECKPOINT_INTERVAL) return 1;
+  return Math.floor((level - 1) / CHECKPOINT_INTERVAL) * CHECKPOINT_INTERVAL;
+}
+
+// 3 of the 5 colors get a quota each level; the other 2 are unrestricted filler.
+// The color needed in the smallest quantity is deliberately the rarest to find.
+// Every few levels also adds a minimum-score objective, an exact-count "scarcity"
+// color, or a "focus" level where one color dominates the whole board.
+function generateObjectives(level, colorRushType = null) {
+  const start = (level - 1) % GEMS.length;
+  const pool = [start, (start+1)%GEMS.length, (start+2)%GEMS.length, (start+3)%GEMS.length, (start+4)%GEMS.length];
+  const colors = pool.slice(0,4);
+  const posInCycle = (level - 1) % DIFFICULTY_CYCLE_LENGTH;
+  const cyclePos = posInCycle + 1;
+  const cycleIndex = Math.min(Math.floor((level - 1) / DIFFICULTY_CYCLE_LENGTH), DIFFICULTY_CYCLE_CAP);
+  const rampRate = 1 + cycleIndex * DIFFICULTY_CYCLE_ESCALATION_RATE;
+  const growthUnits = Math.round(posInCycle * rampRate);
+  const growth = Math.floor(growthUnits / 2);
+  const githubScore = SCORE_OBJECTIVE_BASE + growthUnits * SCORE_OBJECTIVE_GROWTH;
+
+  // x1/x2 never reset to level-1 difficulty. x1 remains the breather.
+  const chapterTriples = [
+    [55,35,15],[70,45,20],[90,60,25],[115,76,32],[145,95,40],
+    [180,118,50],[220,145,62],[265,175,75],[315,208,90],[370,245,108],[430,285,128]
+  ];
+  const [c1,c2,c3] = chapterTriples[Math.min(cycleIndex, chapterTriples.length-1)];
+  if (cyclePos === 1) return [
+    {kind:"color",type:colors[0],required:c1},
+    {kind:"color",type:colors[1],required:c2},
+    {kind:"color",type:colors[2],required:c3}
+  ];
+  if (cyclePos === 2) return [
+    {kind:"color",type:colors[0],required:Math.round(c1*1.18)},
+    {kind:"color",type:colors[1],required:Math.round(c2*1.18)},
+    {kind:"color",type:colors[2],required:Math.max(c3+1,Math.round(c3*1.18))}
+  ];
+
+  // x4 Color Rush = original behavior, shorter by 15 sec per chapter.
+  if (cyclePos === 4) {
+    const favoredColor = colorRushType === null ? Math.floor(Math.random() * GEMS.length) : colorRushType;
+    const seconds = Math.max(COLOR_RUSH_MIN_SECONDS, TIMED_COLOR_SECONDS - cycleIndex*15);
+    return [{kind:"timedColor",type:favoredColor,required:1000 + growthUnits*20,timeLimitSeconds:seconds}];
+  }
+
+  // x5 / x11 Aftershock. The board resolver remains GitHub-original;
+  // this mode raises collection pressure and gives the level a distinct identity.
+  if (cyclePos === 5 || cyclePos === 11) {
+    const second = cyclePos === 11;
+    const main = (second ? 120 : 85) + cycleIndex*(second ? 28 : 22) + growth*2;
+    return [
+      {kind:"aftershock",required:true},
+      {kind:"color",type:colors[0],required:main},
+      {kind:"color",type:colors[1],required:Math.ceil(main*.70)},
+      {kind:"color",type:colors[2],required:Math.ceil(main*.34)}
+    ];
+  }
+
+  // x7 Focus I, strict 2:1.
+  if (cyclePos === 7) {
+    const main = 120 + cycleIndex*38 + growth*2;
+    return [
+      {kind:"color",type:colors[0],required:main},
+      {kind:"color",type:colors[1],required:Math.ceil(main/2)}
+    ];
+  }
+
+  // x8 Specialty I rotates actual specialty types.
+  // Quotas are weighted by creation difficulty; Rainbows are capped at 5.
+  if (cyclePos === 8) {
+    const powers = ["arrow","T","G","R"];
+    const power = powers[cycleIndex % powers.length];
+    const quotas = {
+      arrow: 6 + cycleIndex*2,
+      T: 4 + cycleIndex,
+      G: 4 + cycleIndex,
+      R: Math.min(5, 2 + cycleIndex)
+    };
+    return [{kind:"specialtyTrigger",power,required:quotas[power]}];
+  }
+
+  // x10 Light Rush. Later chapters can remix Grass, Reverse Flow or Oil.
+  // Oil and Reverse Flow are never present together.
+  if (cyclePos === 10) {
+    const out = [{kind:"lightRun",required:ROWS*COLS}];
+    if (cycleIndex >= 3) {
+      const phase = cycleIndex % 3;
+      if (phase === 0) out.push({kind:"reverseFlow",required:true});
+      else if (phase === 1) out.push({kind:"oilRush",required:2 + Math.floor(cycleIndex/2),timeLimitSeconds:null});
+      // phase 2 uses Grass via pickObstaclesForLevel
+    }
+    return out;
+  }
+
+  // x14 Focus II = Focus + finite Scarcity + timer.
+  if (cyclePos === 14) {
+    const main = 650 + cycleIndex*140 + growth*4;
+    const scarce = 3 + Math.floor(cycleIndex/2);
+    return [
+      {kind:"timedColor",type:colors[0],required:main,timeLimitSeconds:Math.max(75,150-cycleIndex*10)},
+      {kind:"color",type:colors[1],required:Math.ceil(main/2)},
+      {kind:"color",type:colors[2],required:scarce,exact:true}
+    ];
+  }
+
+  // x15 Oil Drop = GitHub mode; resolver fix is isolated elsewhere.
+  if (cyclePos === 15) {
+    return [{kind:"oilRush",required:OIL_RUSH_BASE_COUNT + cycleIndex + Math.floor(growth/5),timeLimitSeconds:OIL_RUSH_SECONDS}];
+  }
+
+  // x17 Gravity Shift: target + 10 resolved-move challenge window.
+  if (cyclePos === 17) {
+    const main = 36 + cycleIndex*12 + growth*2;
+    return [
+      {kind:"gravityShift",required:GRAVITY_SHIFT_MOVE_LIMIT},
+      {kind:"color",type:colors[0],required:main},
+      {kind:"color",type:colors[1],required:Math.ceil(main*.62)}
+    ];
+  }
+
+  // x18 Wall Street + Specialty II. Rotate the full combo library instead
+  // of repeating Arrow+TNT / TNT+TNT every chapter.
+  if (cyclePos === 18) {
+    const plans = [
+      [{combo:"AA",required:2}],
+      [{combo:"arrowT",required:2}],
+      [{combo:"TT",required:2}],
+      [{combo:"GT",required:2}],
+      [{combo:"GG",required:2}],
+      [{combo:"arrowR",required:1},{combo:"AA",required:2}],
+      [{combo:"TR",required:1},{combo:"TT",required:2}],
+      [{combo:"GR",required:1},{combo:"GT",required:2}],
+      [{combo:"RR",required:1},{combo:"arrowT",required:2}],
+      [{combo:"AA",required:3},{combo:"GG",required:2}]
+    ];
+    const plan = plans[Math.min(cycleIndex, plans.length-1)];
+    const chapterBump = Math.floor(cycleIndex/5);
+    return plan.map(p=>({kind:"specialtyCombo",combo:p.combo,required:p.required+chapterBump}));
+  }
+
+  // x19 ALL-IN: compatible systems + specific specialty work + score.
+  if (cyclePos === 19) {
+    const allInScores = [800000,950000,1100000,1300000,1500000,1750000,2000000,2300000,2650000,3000000,3400000];
+    const mainColor = 600 + cycleIndex*150;
+    const secondColor = 360 + cycleIndex*95;
+    const scarce = 8 + cycleIndex*2;
+    return [
+      {kind:"allIn",required:true},
+      {kind:"lightRun",required:ROWS*COLS},
+      {kind:"oilRush",required:2 + cycleIndex,timeLimitSeconds:null},
+      {kind:"specialtyTrigger",power:"T",required:12 + cycleIndex*3},
+      {kind:"specialtyCombo",combo:"arrowT",required:2 + Math.floor(cycleIndex/2)},
+      {kind:"color",type:colors[0],required:mainColor},
+      {kind:"color",type:colors[1],required:secondColor},
+      {kind:"color",type:colors[2],required:scarce,exact:true},
+      {kind:"score",required:allInScores[Math.min(cycleIndex,allInScores.length-1)]}
+    ];
+  }
+
+  // x20 Finale = 3 stars + score + 4 colors, one finite scarce.
+  if (cyclePos === 20) {
+    const finaleScores = [700000,850000,1000000,1200000,1450000,1700000,2000000,2350000,2750000,3200000,3700000];
+    const main = 450 + cycleIndex*120;
+    return [
+      {kind:"color",type:colors[0],required:main},
+      {kind:"color",type:colors[1],required:Math.ceil(main*.67)},
+      {kind:"color",type:colors[2],required:Math.ceil(main*.40)},
+      {kind:"color",type:colors[3],required:3 + Math.floor(cycleIndex/2),exact:true},
+      {kind:"score",required:finaleScores[Math.min(cycleIndex,finaleScores.length-1)]},
+      {kind:"starChallenge",required:3}
+    ];
+  }
+
+  // x12 and x16 preserve GitHub finite Scarcity 5:3:1.
+  const isScarcity = cyclePos === 12 || cyclePos === 16;
+  let colorObjectives;
+  if (isScarcity) {
+    const later = cyclePos === 16;
+    const main = (later ? 200 : 150) + cycleIndex*(later ? 65 : 55);
+    const scarce = (later ? 6 : 5) + cycleIndex*2;
+    colorObjectives = [
+      {kind:"color",type:colors[0],required:main},
+      {kind:"color",type:colors[1],required:Math.ceil(main*.60)},
+      {kind:"color",type:colors[2],required:scarce,exact:true}
+    ];
+  } else if ([3,9,13].includes(cyclePos)) {
+    // Score Pressure keeps the original GitHub score formula, but its colour
+    // requirements now scale to match the number of gems actually cleared.
+    const baseBySlot = {
+      3:[90,60,24],
+      9:[200,135,50],
+      13:[260,175,65]
+    };
+    const base = baseBySlot[cyclePos];
+    const chapterFactor = 1 + cycleIndex*.28;
+    colorObjectives = base.map((qty,i)=>({
+      kind:"color",
+      type:colors[i],
+      required:Math.round(qty*chapterFactor),
+      exact:false
+    }));
+  } else {
+    // General 10x10 calibration: minimum total request is roughly one board,
+    // then rises with position and chapter.
+    const total = 105 + posInCycle*9 + cycleIndex*42;
+    const qty = [Math.round(total*.54),Math.round(total*.32),Math.round(total*.14)];
+    colorObjectives = colors.slice(0,3).map((type,i)=>({kind:"color",type,required:qty[i],exact:false}));
+  }
+
+  const objectives = [...colorObjectives];
+
+  // Preserve original GitHub Score Pressure I, II, III score formula exactly.
+  if ([3,9,13].includes(cyclePos)) {
+    objectives.push({kind:"score",required:githubScore});
+  }
+  return objectives;
+}
+
+// Greedily converts a heat count into starting power-ups — rainbows first
+// (biggest reward for the longest streaks), then TNT, arrow, grenade —
+// capped at MAX_HEAT_POWERUPS total pieces. Returns the allocation plus how
+// much heat was actually spent (any remainder keeps accumulating).
+function heatToPowerups(heatValue) {
+  const order = [{
+    kind: "R",
+    cost: POWERUP_COSTS.R
+  }, {
+    kind: "T",
+    cost: POWERUP_COSTS.T
+  }, {
+    kind: "arrow",
+    cost: POWERUP_COSTS.arrow
+  }, {
+    kind: "G",
+    cost: POWERUP_COSTS.G
+  }];
+  let remaining = heatValue;
+  let count = 0;
+  const allocation = {
+    G: 0,
+    arrow: 0,
+    T: 0,
+    R: 0
+  };
+  for (const {
+    kind,
+    cost
+  } of order) {
+    while (remaining >= cost && count < MAX_HEAT_POWERUPS) {
+      allocation[kind]++;
+      remaining -= cost;
+      count++;
+    }
+  }
+  return {
+    allocation,
+    spent: heatValue - remaining
+  };
+}
+function computeWeights(objectives) {
+  const weights = Array(GEMS.length).fill(FILLER_WEIGHT);
+
+  objectives.forEach(o => {
+    if (o.kind === "color") {
+      if (o.exact) {
+        // Finite Scarcity remains truly finite: no refill spawns.
+        weights[o.type] = 0;
+      } else {
+        // IMPORTANT: objective quota and spawn probability are separate systems.
+        // Large 100–600+ objectives must not become 100–600x refill weights.
+        // Square-root scaling preserves a useful preference without cascade flooding.
+        const quota = Math.max(1, Number(o.required || 1));
+        weights[o.type] = Math.min(36, FILLER_WEIGHT + Math.sqrt(quota));
+      }
+    }
+
+    if (o.kind === "timedColor") {
+      // Timed focus is intentionally favored, but still bounded.
+      // This remains much more common than filler colors without flooding the board.
+      weights[o.type] = 42;
+    }
+  });
+
+  return weights;
+}
+function weightedType(weights) {
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < weights.length; i++) {
+    if (r < weights[i]) return i;
+    r -= weights[i];
+  }
+  return weights.length - 1;
+}
+function cell(t, p = null, obstacle = null, bonus = null) {
+  return {
+    t,
+    p,
+    obstacle,
+    bonus
+  };
+}
+function idx(r, c) {
+  return r * COLS + c;
+}
+function key(r, c) {
+  return `${r}-${c}`;
+}
+
+// Would placing color `t` at (r,c) complete a match against cells already
+// placed above/left of it? Used by makeBoard/shuffleBoard to build a
+// match-free board cell-by-cell instead of generate-whole-board-and-retry,
+// which can hang indefinitely under heavily skewed spawn weights (e.g.
+// timedColor levels favor one color ~6x — an accident-free random board
+// becomes astronomically unlikely to land on by chance).
+function wouldCreateInitialMatch(board, r, c, t) {
+  if (c >= 2 && board[r][c - 1] && board[r][c - 2] && board[r][c - 1].t === t && board[r][c - 2].t === t) return true;
+  if (r >= 2 && board[r - 1][c] && board[r - 2][c] && board[r - 1][c].t === t && board[r - 2][c].t === t) return true;
+  if (r >= 1 && c >= 1 && board[r - 1][c - 1] && board[r - 1][c] && board[r][c - 1] && board[r - 1][c - 1].t === t && board[r - 1][c].t === t && board[r][c - 1].t === t) return true;
+  return false;
+}
+function makeBoard(weights) {
+  const board = Array.from({
+    length: ROWS
+  }, () => Array(COLS).fill(null));
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      let t = weightedType(weights);
+      let tries = 0;
+      while (wouldCreateInitialMatch(board, r, c, t) && tries < 30) {
+        t = weightedType(weights);
+        tries++;
+      }
+      if (wouldCreateInitialMatch(board, r, c, t)) {
+        // pathological weighting — fall back to the first color that's legal here
+        for (let candidate = 0; candidate < GEMS.length; candidate++) {
+          if (!wouldCreateInitialMatch(board, r, c, candidate)) {
+            t = candidate;
+            break;
+          }
+        }
+      }
+      board[r][c] = cell(t);
+    }
+  }
+  return board;
+}
+
+// Scatters exactly `count` gems of `color` onto a board that was generated with
+// that color's spawn weight at 0, so it never respawns during refills — the
+// player has to fish out exactly this many, no more ever appear.
+function scatterExactColor(board, color, count) {
+  let result = cloneBoard(board);
+  let placed = 0;
+  let attempts = 0;
+  while (placed < count && attempts < 800) {
+    attempts++;
+    const r = Math.floor(Math.random() * ROWS);
+    const c = Math.floor(Math.random() * COLS);
+    if (result[r][c].t === color) continue;
+    const trial = cloneBoard(result);
+    trial[r][c] = cell(color, null);
+    if (analyzeBoard(trial).groups.length === 0) {
+      result = trial;
+      placed++;
+    }
+  }
+  // rare fallback if the board is too dense to place without a match — force it
+  while (placed < count) {
+    const r = Math.floor(Math.random() * ROWS);
+    const c = Math.floor(Math.random() * COLS);
+    if (result[r][c].t !== color) {
+      result[r][c] = cell(color, null);
+      placed++;
+    }
+  }
+  return result;
+}
+function cloneBoard(board) {
+  return board.map(row => row.map(c => c ? {
+    ...c
+  } : null));
+}
+
+// Every OBSTACLE_LEVEL_INTERVAL levels, one obstacle kind shows up, rotating
+// through ice / wall / grass and scaling in count every 3 appearances.
+function chapterTwistsForLevel(level) {
+  const cycleIndex = Math.floor((level - 1) / DIFFICULTY_CYCLE_LENGTH);
+  const cyclePos = (level - 1) % DIFFICULTY_CYCLE_LENGTH + 1;
+  if (cycleIndex === 0) return [];
+  const twists = [];
+
+  // Later 20-level chapters remix already-learned systems instead of merely inflating quotas.
+  if (cycleIndex >= 1 && [7, 14].includes(cyclePos)) twists.push("grass");
+  if (cycleIndex >= 1 && [9, 13].includes(cyclePos)) twists.push("ice");
+  if (cycleIndex >= 2 && cyclePos === 10) twists.push(cycleIndex % 3 === 2 ? "ice" : cycleIndex % 3 === 0 ? "wall" : "grass");
+  if (cycleIndex >= 2 && cyclePos === 17) twists.push(cycleIndex % 2 === 0 ? "grass" : "ice");
+  if (cycleIndex >= 3 && [3, 11].includes(cyclePos)) twists.push("wall");
+  if (cycleIndex >= 4 && cyclePos === 15) twists.push(cycleIndex % 2 === 0 ? "ice" : "grass");
+  if (cycleIndex >= 6 && [12, 16].includes(cyclePos)) twists.push("wall");
+  if (cycleIndex >= 7 && cyclePos === 8) twists.push("grass");
+  if (cycleIndex >= 8 && [6, 18].includes(cyclePos)) twists.push("allObstacles");
+  return [...new Set(twists)];
+}
+
+function pickObstaclesForLevel(level) {
+  const cyclePos = (level - 1) % DIFFICULTY_CYCLE_LENGTH + 1;
+  const cycleIndex = Math.floor((level - 1) / DIFFICULTY_CYCLE_LENGTH);
+  const base = Math.min(15, 3 + cycleIndex);
+
+  if (cyclePos === 6) {
+    // Ice Field: starting ice rises by chapter; spreading is handled after moves.
+    return [{kind:"ice",count:Math.min(18,3 + cycleIndex*2)}];
+  }
+  if (cyclePos === 12) {
+    // Grass Menace + Scarcity stays Grass-led in every chapter.
+    return [{kind:"grass",count:Math.min(16,3 + cycleIndex*2)}];
+  }
+  if (cyclePos === 18) {
+    // Wall Street owns the wall identity.
+    return [{kind:"wall",count:Math.min(14,3 + cycleIndex)}];
+  }
+  if (cyclePos === 19) {
+    return [
+      {kind:"ice",count:Math.max(4,base)},
+      {kind:"grass",count:Math.max(4,base)},
+      {kind:"wall",count:Math.max(3,base-1)}
+    ];
+  }
+
+  // Light Rush later chapters can carry Grass as the third remix option.
+  if (cyclePos === 10 && cycleIndex >= 3 && cycleIndex % 3 === 2) {
+    return [{kind:"grass",count:Math.min(14,4 + cycleIndex)}];
+  }
+
+  // Preserve useful later-chapter remixes from GitHub without changing core slots.
+  const chapterTwists = chapterTwistsForLevel(level)
+    .filter(kind => ["ice","grass","wall"].includes(kind));
+  return chapterTwists.map(kind => ({
+    kind,
+    count:kind==="wall" ? Math.max(3,base-1) : Math.max(3,base)
+  }));
+}
+
+// Scatters `count` obstacle overlays onto random cells, skipping any cell in
+// avoidCells (e.g. exact-scarcity color cells, so an obstacle can't wall off
+// a gem the player is required to clear).
+function scatterObstacles(board, kind, count, avoidCells) {
+  const result = cloneBoard(board);
+  const cells = [];
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (!avoidCells.has(key(r, c)) && !result[r][c].obstacle) cells.push([r, c]);
+  for (let i = cells.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [cells[i], cells[j]] = [cells[j], cells[i]];
+  }
+  const hits = kind === "ice" ? ICE_HITS : kind === "grass" ? GRASS_HITS : WALL_HITS;
+  for (let i = 0; i < Math.min(count, cells.length); i++) {
+    const [r, c] = cells[i];
+    if (kind === "wall") {
+      result[r][c] = cell(null, null, {
+        kind: "wall",
+        hits
+      });
+    } else {
+      result[r][c] = cell(result[r][c].t, null, {
+        kind,
+        hits
+      });
+    }
+  }
+  return result;
+}
+function countObstacles(board, kind) {
+  let count = 0;
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    const d = board[r][c];
+    if (d && d.obstacle && d.obstacle.kind === kind) count++;
+  }
+  return count;
+}
+
+// Scatters Oil Drop gems ONLY for an Oil Rush level, spread
+// across distinct random cells.
+function scatterOilDrops(board, count, avoidCells) {
+  const result = cloneBoard(board);
+  const cells = [];
+  for (let r = 0; r < Math.min(5, ROWS); r++) for (let c = 0; c < COLS; c++) if (!avoidCells.has(key(r, c)) && result[r][c].t !== null && !result[r][c].obstacle) cells.push([r, c]);
+  for (let i = cells.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [cells[i], cells[j]] = [cells[j], cells[i]];
+  }
+  for (let i = 0; i < Math.min(count, cells.length); i++) {
+    const [r, c] = cells[i];
+    result[r][c] = { ...result[r][c], t:null, p:null, obstacle:null, bonus:"oil" };
+  }
+  return result;
+}
+
+// Finds the nearest cell (by Manhattan distance) matching a predicate.
+function nearestCellOfType(board, matchFn, fromR, fromC) {
+  let best = null;
+  let bestDist = Infinity;
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (r === fromR && c === fromC || !board[r][c]) continue;
+      if (matchFn(board[r][c], r, c)) {
+        const d = Math.abs(r - fromR) + Math.abs(c - fromC);
+        if (d < bestDist) {
+          bestDist = d;
+          best = [r, c];
+        }
+      }
+    }
+  }
+  return best;
+}
+
+// One orthogonal step from (fromR,fromC) toward (toR,toC).
+function stepToward(fromR, fromC, toR, toC) {
+  const dr = toR - fromR;
+  const dc = toC - fromC;
+  if (Math.abs(dr) >= Math.abs(dc) && dr !== 0) return [fromR + Math.sign(dr), fromC];
+  if (dc !== 0) return [fromR, fromC + Math.sign(dc)];
+  return [fromR, fromC];
+}
+
+function grenadeTargetCell(board, fromR, fromC) {
+  let target=nearestCellOfType(board,d=>d&&d.obstacle,fromR,fromC);
+  if (target) return target;
+  return nearestCellOfType(board,d=>d&&d.t!==null&&!d.obstacle&&d.bonus!=="oil",fromR,fromC);
+}
+
+// Un-triggered grenades nudge one step per move toward whatever helps clear
+// the level — an obstacle first (grenades break walls instantly), otherwise
+// the color the player is furthest behind on. Bypasses normal swap rules —
+// this is a board-assist effect, not a player action, so it just relocates
+// the grenade's cell content with whatever sits at the destination.
+// All target/step decisions are computed from the ORIGINAL board first, then
+// applied together — otherwise a moved grenade could be re-scanned and moved
+// again within the same pass, jumping far more than one step per turn.
+function repositionGrenades(board, objectives, progress) {
+  const moves = [];
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const cellData = board[r][c];
+      if (!cellData || cellData.p !== "G") continue;
+      let target = nearestCellOfType(board, d => d && d.obstacle, r, c);
+      if (!target) {
+        const colorObjectives = objectives.filter(o => (o.kind === "color" || o.kind === "timedColor") && (progress[o.type] || 0) < o.required);
+        if (colorObjectives.length) {
+          colorObjectives.sort((x, y) => y.required - (progress[y.type] || 0) - (x.required - (progress[x.type] || 0)));
+          const neededColor = colorObjectives[0].type;
+          target = nearestCellOfType(board, d => d && d.t === neededColor && !d.obstacle, r, c);
+        }
+      }
+      if (target) {
+        const [tr, tc] = target;
+        const dist = Math.abs(tr - r) + Math.abs(tc - c);
+        if (dist > 1) {
+          const [nr, nc] = stepToward(r, c, tr, tc);
+          if (nr !== r || nc !== c) moves.push({
+            from: [r, c],
+            to: [nr, nc]
+          });
+        }
+      }
+    }
+  }
+  if (moves.length === 0) return board; // nothing to move — skip the clone/re-render entirely
+
+  const next = cloneBoard(board);
+  moves.forEach(({
+    from,
+    to
+  }) => {
+    const [fr, fc] = from;
+    const [tr, tc] = to;
+    if (next[fr] && next[fr][fc] && next[tr] && next[tr][tc]) {
+      const temp = next[tr][tc];
+      next[tr][tc] = next[fr][fc];
+      next[fr][fc] = temp;
+    }
+  });
+  return next;
+}
+
+// Central obstacle resolver: takes a raw set of cells a clear-step wants to
+// remove, and applies ice/grass absorption + wall adjacency damage. Returns
+// the board with obstacle hit-counters updated, the ACTUAL cells that clear
+// this round (obstacles that survived are removed from it), and any oil-drop
+// bonus cells swept up along the way.
+function processClear(board, rawClearSet) {
+  const next = cloneBoard(board);
+  const actual = new Set();
+  const bonuses = [];
+  const grassTouched = new Set();
+  rawClearSet.forEach(k => {
+    const [r, c] = k.split("-").map(Number);
+    const d = next[r][c];
+    if (!d) return;
+    if (d.bonus === "oil") return; // Oil Drop is a true falling piece; only exiting the bottom collects it.
+    if (d.obstacle && d.obstacle.kind === "ice") {
+      const hits = d.obstacle.hits - 1;
+      next[r][c] = {
+        ...d,
+        obstacle: hits > 0 ? {
+          kind: "ice",
+          hits
+        } : null
+      };
+      return; // ice absorbs the hit — the gem itself survives this round
+    }
+    if (d.obstacle && d.obstacle.kind === "grass") {
+      grassTouched.add(k);
+      const hits = d.obstacle.hits - 1;
+      if (hits > 0) {
+        next[r][c] = {
+          ...d,
+          obstacle: {
+            kind: "grass",
+            hits
+          }
+        };
+        return; // survives, needs one more hit
+      }
+      // hits hit 0 — clears along with the gem this round, fall through
+    }
+    actual.add(k);
+  });
+
+  // Walls ignore ordinary adjacent matches completely.
+  // They clear only when a specialty effect directly includes the wall cell.
+  // Because walls have no gem color, normal match groups can never include them.
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      const d = next[r][c];
+      if (!d || !d.obstacle || d.obstacle.kind !== "wall") continue;
+      const kHere = key(r, c);
+      if (rawClearSet.has(kHere)) actual.add(kHere);
+    }
+  }
+  return {
+    board: next,
+    clearSet: actual,
+    bonuses,
+    grassTouched
+  };
+}
+
+// ---- Union-Find ----
+class DSU {
+  constructor(n) {
+    this.parent = Array.from({
+      length: n
+    }, (_, i) => i);
+  }
+  find(x) {
+    while (this.parent[x] !== x) {
+      this.parent[x] = this.parent[this.parent[x]];
+      x = this.parent[x];
+    }
+    return x;
+  }
+  union(a, b) {
+    const ra = this.find(a),
+      rb = this.find(b);
+    if (ra !== rb) this.parent[ra] = rb;
+  }
+}
+function analyzeBoard(board) {
+  const n = ROWS * COLS;
+  const dsu = new DSU(n);
+  const isSquare = new Set();
+  const hRun = new Map();
+  const vRun = new Map();
+  for (let r = 0; r < ROWS - 1; r++) {
+    for (let c = 0; c < COLS - 1; c++) {
+      const a = board[r][c],
+        b = board[r][c + 1],
+        d = board[r + 1][c],
+        e = board[r + 1][c + 1];
+      if (a && b && d && e && a.bonus !== "oil" && b.bonus !== "oil" && d.bonus !== "oil" && e.bonus !== "oil" && a.t !== null && a.t === b.t && a.t === d.t && a.t === e.t) {
+        dsu.union(idx(r, c), idx(r, c + 1));
+        dsu.union(idx(r, c), idx(r + 1, c));
+        dsu.union(idx(r, c), idx(r + 1, c + 1));
+        [[r, c], [r, c + 1], [r + 1, c], [r + 1, c + 1]].forEach(([rr, cc]) => isSquare.add(key(rr, cc)));
+      }
+    }
+  }
+  for (let r = 0; r < ROWS; r++) {
+    let run = 1;
+    for (let c = 1; c <= COLS; c++) {
+      const same = c < COLS && board[r][c] && board[r][c - 1] && board[r][c].bonus !== "oil" && board[r][c-1].bonus !== "oil" && board[r][c].t !== null && board[r][c].t === board[r][c - 1].t;
+      if (same) run++;else {
+        if (run >= 3) {
+          for (let k = c - run; k < c; k++) {
+            hRun.set(key(r, k), run);
+            if (k > c - run) dsu.union(idx(r, k), idx(r, k - 1));
+          }
+        }
+        run = 1;
+      }
+    }
+  }
+  for (let c = 0; c < COLS; c++) {
+    let run = 1;
+    for (let r = 1; r <= ROWS; r++) {
+      const same = r < ROWS && board[r][c] && board[r - 1][c] && board[r][c].bonus !== "oil" && board[r-1][c].bonus !== "oil" && board[r][c].t !== null && board[r][c].t === board[r - 1][c].t;
+      if (same) run++;else {
+        if (run >= 3) {
+          for (let k = r - run; k < r; k++) {
+            vRun.set(key(k, c), run);
+            if (k > r - run) dsu.union(idx(k, c), idx(k - 1, c));
+          }
+        }
+        run = 1;
+      }
+    }
+  }
+  const flagged = new Set([...isSquare, ...hRun.keys(), ...vRun.keys()]);
+  if (flagged.size === 0) return {
+    groups: []
+  };
+  const groupMap = new Map();
+  flagged.forEach(k => {
+    const [r, c] = k.split("-").map(Number);
+    const root = dsu.find(idx(r, c));
+    if (!groupMap.has(root)) {
+      groupMap.set(root, {
+        cells: new Set(),
+        hasSquare: false,
+        maxH: 0,
+        maxV: 0,
+        type: board[r][c].t
+      });
+    }
+    const g = groupMap.get(root);
+    g.cells.add(k);
+    if (isSquare.has(k)) g.hasSquare = true;
+    if (hRun.has(k)) g.maxH = Math.max(g.maxH, hRun.get(k));
+    if (vRun.has(k)) g.maxV = Math.max(g.maxV, vRun.get(k));
+  });
+  const groups = [...groupMap.values()].map(g => {
+    let power = null;
+    // Rainbow-priority ordering: a 5-in-line check comes first, then right-angle
+    // (TNT), then square (Grenade) — so a match that happens to also touch a
+    // square/right-angle shape still correctly becomes a Rainbow when it qualifies.
+    if (g.maxH >= 5 || g.maxV >= 5) power = "R";else if (g.maxH >= 3 && g.maxV >= 3) power = "T";else if (g.maxH === 4) power = "H";else if (g.maxV === 4) power = "V";else if (g.hasSquare) power = "G";
+    return {
+      cells: g.cells,
+      power,
+      type: g.type
+    };
+  });
+  return {
+    groups
+  };
+}
+function pickAnchor(cellsSet, swapHints) {
+  const cells = [...cellsSet];
+  if (swapHints) {
+    for (const hint of swapHints) {
+      if (cellsSet.has(hint)) return hint;
+    }
+  }
+  return cells.sort()[0];
+}
+const COMBO_BLAST_RADIUS = 3; // absolute radius for grenade/TNT when combined in a 2-power-up swap (7x7 = 49 cells)
+
+function areaCells(power, r, c, radiusOverride) {
+  const out = [];
+  if (power === "H") {
+    for (let cc = 0; cc < COLS; cc++) out.push(key(r, cc));
+  } else if (power === "V") {
+    for (let rr = 0; rr < ROWS; rr++) out.push(key(rr, c));
+  } else if (power === "G") {
+    const radius = radiusOverride !== undefined ? radiusOverride : 1;
+    for (let rr = r - radius; rr <= r + radius; rr++) for (let cc = c - radius; cc <= c + radius; cc++) if (rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS) out.push(key(rr, cc));
+  } else if (power === "T") {
+    const radius = radiusOverride !== undefined ? radiusOverride : 2;
+    for (let rr = r - radius; rr <= r + radius; rr++) for (let cc = c - radius; cc <= c + radius; cc++) if (rr >= 0 && rr < ROWS && cc >= 0 && cc < COLS) out.push(key(rr, cc));
+  }
+  return out;
+}
+function expandClears(board, initialCells, radiusOverride) {
+  const toClear = new Set(initialCells);
+  const queue = [...initialCells];
+  while (queue.length) {
+    const k = queue.pop();
+    const [r, c] = k.split("-").map(Number);
+    const cd = board[r][c];
+    if (!cd || !cd.p || cd.p === "R") continue;
+    for (const nk of areaCells(cd.p, r, c, radiusOverride)) {
+      if (!toClear.has(nk)) {
+        toClear.add(nk);
+        queue.push(nk);
+      }
+    }
+  }
+  return toClear;
+}
+function tally(board, cellsSet) {
+  const counts = Array(GEMS.length).fill(0);
+  cellsSet.forEach(k => {
+    const [r, c] = k.split("-").map(Number);
+    const d = board[r][c];
+    if (d && d.t !== null && d.t !== undefined) counts[d.t]++;
+  });
+  return counts;
+}
+function triggeredSpecials(board, cellsSet) {
+  const list = [];
+  cellsSet.forEach(k => {
+    const [r, c] = k.split("-").map(Number);
+    const d = board[r][c];
+    if (d && d.p) list.push({
+      r,
+      c,
+      power: d.p
+    });
+  });
+  return list;
+}
+function applyGravity(board, weights, reverse = false) {
+  const next = cloneBoard(board);
+  for (let c=0;c<COLS;c++) {
+    const wallRows = [];
+    for (let r=0;r<ROWS;r++) {
+      if (next[r][c] && next[r][c].obstacle && next[r][c].obstacle.kind === "wall") wallRows.push(r);
+    }
+    const bounds = [-1,...wallRows,ROWS];
+
+    for (let b=0;b<bounds.length-1;b++) {
+      const lo=bounds[b]+1, hi=bounds[b+1]-1;
+      if (lo>hi) continue;
+      const values=[];
+      for (let r=lo;r<=hi;r++) {
+        if (next[r][c]) values.push(next[r][c]);
+        next[r][c]=null;
+      }
+
+      if (!reverse) {
+        let p=hi;
+        for (let i=values.length-1;i>=0;i--) next[p--][c]=values[i];
+        for (let r=p;r>=lo;r--) next[r][c]=cell(weightedType(weights));
+      } else {
+        let p=lo;
+        for (let i=0;i<values.length;i++) next[p++][c]=values[i];
+        for (let r=p;r<=hi;r++) next[r][c]=cell(weightedType(weights));
+      }
+    }
+  }
+  return next;
+}
+function wouldMatch(board, r1, c1, r2, c2) {
+  const test = cloneBoard(board);
+  [test[r1][c1], test[r2][c2]] = [test[r2][c2], test[r1][c1]];
+  return analyzeBoard(test).groups.length > 0;
+}
+function hasAnyMove(board) {
+  for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+    if (c < COLS - 1 && wouldMatch(board, r, c, r, c + 1)) return true;
+    if (r < ROWS - 1 && wouldMatch(board, r, c, r + 1, c)) return true;
+  }
+  return false;
+}
+function shuffleBoard(board) {
+  // Shuffle ordinary gems only. Oil Drops, specialty gems and obstacles keep
+  // their identity so a no-moves shuffle never deletes mission pieces.
+  let best = cloneBoard(board);
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const next = cloneBoard(board);
+    const movable = [];
+    const positions = [];
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const d = board[r][c];
+      if (d && !d.obstacle && !d.bonus && !d.p) {
+        movable.push(d.t);
+        positions.push([r,c]);
+        next[r][c] = null;
+      }
+    }
+    for (let i = movable.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [movable[i], movable[j]] = [movable[j], movable[i]];
+    }
+    positions.forEach(([r,c], i) => { next[r][c] = cell(movable[i]); });
+    best = next;
+    if (analyzeBoard(next).groups.length === 0 && hasAnyMove(next)) return next;
+  }
+  return best;
+}
+const POWER_NAMES = {
+  H: "Arrow",
+  V: "Arrow",
+  arrow: "Arrow",
+  G: "Grenade",
+  T: "TNT",
+  R: "Rainbow",
+  any: "specialty"
+};
+
+const COMBO_LABELS = {
+  AA: "Arrow + Arrow",
+  arrowT: "Arrow + TNT",
+  arrowG: "Arrow + Grenade",
+  TT: "TNT + TNT",
+  GT: "Grenade + TNT",
+  GG: "Grenade + Grenade",
+  RR: "Rainbow + Rainbow",
+  arrowR: "Arrow + Rainbow",
+  TR: "TNT + Rainbow",
+  GR: "Grenade + Rainbow"
+};
+function comboLabel(combo) {
+  return COMBO_LABELS[combo] || combo;
+}
+function GemGradientDefs() {
+  // Rendered once for the whole board — every GemShape references these by
+  // id rather than each of the ~100 cells redefining its own copy.
+  return /*#__PURE__*/React.createElement("svg", {
+    width: "0",
+    height: "0",
+    style: {
+      position: "absolute"
+    },
+    "aria-hidden": "true"
+  }, /*#__PURE__*/React.createElement("defs", null, GEMS.map((g, i) => /*#__PURE__*/React.createElement("linearGradient", {
+    key: i,
+    id: `gemGrad-${i}`,
+    x1: "0%",
+    y1: "0%",
+    x2: "100%",
+    y2: "100%"
+  }, /*#__PURE__*/React.createElement("stop", {
+    offset: "0%",
+    stopColor: "#ffffff"
+  }), /*#__PURE__*/React.createElement("stop", {
+    offset: "16%",
+    stopColor: g.color
+  }), /*#__PURE__*/React.createElement("stop", {
+    offset: "72%",
+    stopColor: g.color
+  }), /*#__PURE__*/React.createElement("stop", {
+    offset: "100%",
+    stopColor: "#4c2f77"
+  })))));
+}
+function GemShape({
+  type,
+  size
+}) {
+  const g = GEMS[type];
+  const s = size * 0.69;
+  const common = {
+    fill: `url(#gemGrad-${type})`,
+    stroke: "rgba(255,255,255,0.82)",
+    strokeWidth: 0.7
+  };
+  return /*#__PURE__*/React.createElement("svg", {
+    width: s,
+    height: s,
+    viewBox: "0 0 24 24",
+    style: {
+      filter: "drop-shadow(0 4px 5px rgba(0,0,0,0.34)) drop-shadow(0 0 10px rgba(255,255,255,0.26))"
+    }
+  }, g.shape === "flame" && /*#__PURE__*/React.createElement("path", {
+    d: "M12 2c2 3-1 4-1 7a3 3 0 003 3c1.7 0 2-1.3 2-1.3.8 1.3 1 2.6 1 3.8a5 5 0 01-10 0C6 10 9 8 12 2z",
+    ...common
+  }), g.shape === "leaf" && /*#__PURE__*/React.createElement("path", {
+    d: "M20 4C10 4 4 10 4 20c10 0 16-6 16-16z",
+    ...common
+  }), g.shape === "drop" && /*#__PURE__*/React.createElement("path", {
+    d: "M12 2c4 5 7 9 7 13a7 7 0 11-14 0c0-4 3-8 7-13z",
+    ...common
+  }), g.shape === "star" && /*#__PURE__*/React.createElement("path", {
+    d: "M12 2l2.6 6.9L22 9.7l-5.6 4.8L18 22l-6-4-6 4 1.6-7.5L2 9.7l7.4-.8z",
+    ...common
+  }), g.shape === "gem" && /*#__PURE__*/React.createElement("path", {
+    d: "M6 3h12l4 6-10 12L2 9z",
+    ...common
+  }));
+}
+function PowerupShape({
+  power,
+  size,
+  color
+}) {
+  const base = {
+    position: "absolute",
+    inset: 0,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    pointerEvents: "none"
+  };
+  if (power === "H" || power === "V") {
+    const vertical = power === "V";
+    return /*#__PURE__*/React.createElement("div", {
+      className: "special-pulse",
+      style: base
+    }, /*#__PURE__*/React.createElement("div", {
+      style: {
+        width: size * (vertical ? 0.5 : 0.82),
+        height: size * (vertical ? 0.82 : 0.5),
+        borderRadius: 999,
+        background: `linear-gradient(${vertical ? "180deg" : "90deg"},rgba(255,255,255,.98) 0%,${color} 28%,${color} 76%,rgba(20,16,45,.85) 100%)`,
+        border: `2px solid ${color}`,
+        boxShadow: `0 0 18px ${color},0 0 28px ${color}`,
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#15142b",
+        fontWeight: 1000,
+        fontSize: size * 0.46,
+        lineHeight: 1
+      }
+    }, vertical ? "↕" : "↔"));
+  }
+  if (power === "G") return /*#__PURE__*/React.createElement("div", {
+    className: "special-pulse",
+    style: base
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: size * 0.76,
+      height: size * 0.76,
+      borderRadius: "50%",
+      position: "relative",
+      background: `radial-gradient(circle at 34% 28%,#ffffff 0%,${color} 28%,${color} 68%,#17142d 100%)`,
+      border: `2px solid ${color}`,
+      boxShadow: `0 0 20px ${color},inset -5px -7px 8px rgba(0,0,0,.32)`
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      right: size * 0.02,
+      top: -size * 0.07,
+      width: size * 0.2,
+      height: size * 0.13,
+      borderRadius: 3,
+      background: color,
+      border: "1px solid white",
+      transform: "rotate(25deg)"
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      right: -size * 0.09,
+      top: -size * 0.17,
+      width: size * 0.3,
+      height: size * 0.16,
+      borderTop: `3px solid ${color}`,
+      borderRadius: "50%",
+      transform: "rotate(20deg)"
+    }
+  })));
+  if (power === "T") return /*#__PURE__*/React.createElement("div", {
+    className: "special-pulse",
+    style: base
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: size * 0.88,
+      height: size * 0.64,
+      borderRadius: size * 0.12,
+      position: "relative",
+      background: `linear-gradient(180deg,#ffffff 0%,${color} 22%,${color} 78%,#17142d 100%)`,
+      border: `2px solid ${color}`,
+      boxShadow: `0 0 20px ${color},inset 0 -6px 9px rgba(0,0,0,.35)`,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      color: "white",
+      fontWeight: 1000,
+      fontSize: size * 0.24,
+      letterSpacing: 1,
+      textShadow: "0 2px 2px rgba(0,0,0,.4)"
+    }
+  }, "TNT", /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      left: "31%",
+      top: -size * 0.14,
+      width: size * 0.38,
+      height: size * 0.18,
+      borderTop: `3px solid ${color}`,
+      borderRadius: "50%"
+    }
+  })));
+  if (power === "R") return /*#__PURE__*/React.createElement("div", {
+    className: "special-pulse",
+    style: base
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: size * 0.88,
+      height: size * 0.88,
+      borderRadius: "50%",
+      background: "conic-gradient(#ff4b78,#ffd34f,#71e98f,#4dc4ff,#8a74ff,#d65cff,#ff4b78)",
+      border: "3px solid white",
+      boxShadow: "0 0 20px rgba(176,108,255,.95),0 0 32px rgba(77,184,255,.65),inset 0 0 12px rgba(255,255,255,.7)",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      color: "white",
+      fontSize: size * 0.36,
+      fontWeight: 900,
+      textShadow: "0 2px 4px rgba(0,0,0,.45)"
+    }
+  }, "★"));
+  return null;
+}
+function CellView({
+  data,
+  size,
+  selected,
+  onClick,
+  onDoubleClick,
+  onPointerDown,
+  onPointerUp,
+  lightRunActive,
+  illuminated,
+  lightDarkness
+}) {
+  if (!data) return /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: size,
+      height: size
+    }
+  });
+  const obstacle = data.obstacle;
+  const isWall = obstacle && obstacle.kind === "wall";
+  const isIce = obstacle && obstacle.kind === "ice";
+  const isGrass = obstacle && obstacle.kind === "grass";
+  const isLocked = isWall || isIce;
+  return /*#__PURE__*/React.createElement("div", {
+    onClick: onClick,
+    onDoubleClick: onDoubleClick,
+    onPointerDown: onPointerDown,
+    onPointerUp: onPointerUp,
+    className: "gem-cell",
+    style: {
+      width: size,
+      height: size,
+      borderRadius: 8,
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      position: "relative",
+      cursor: isLocked ? "not-allowed" : "pointer",
+      touchAction: "none",
+      WebkitTapHighlightColor: "transparent",
+      background: selected ? "radial-gradient(circle at 35% 25%, rgba(255,255,255,0.34), rgba(255,211,79,0.24) 36%, rgba(176,108,255,0.20) 100%)" : "linear-gradient(145deg, rgba(255,255,255,0.13), rgba(91,74,165,0.08) 55%, rgba(255,255,255,0.025))",
+      outline: selected ? "2px solid #ffd34f" : "1px solid rgba(255,255,255,0.05)",
+      boxShadow: selected ? "0 0 22px rgba(255,211,79,0.92), inset 0 0 14px rgba(255,255,255,0.18)" : "inset 0 1px 0 rgba(255,255,255,0.14), inset 0 -8px 14px rgba(28,20,58,0.12), 0 5px 12px rgba(0,0,0,0.20)"
+    }
+  }, data.bonus === "oil" ? /*#__PURE__*/React.createElement("div", {
+    className: "special-pulse",
+    style: {
+      width: size * 0.72, height: size * 0.72, transform: "rotate(45deg)",
+      borderRadius: "55% 55% 62% 55%",
+      background: "radial-gradient(circle at 28% 24%, #fff7c7 0%, #ffd34f 20%, #f2a93b 52%, #9b5d20 100%)",
+      border: "2px solid rgba(255,245,190,.95)",
+      boxShadow: "0 0 18px rgba(255,211,79,.72), inset -5px -7px 9px rgba(93,47,10,.28)",
+      display: "flex", alignItems: "center", justifyContent: "center"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style:{transform:"rotate(-45deg)",fontSize:size*.25,fontWeight:950,color:"#5e3915",textShadow:"0 1px 0 rgba(255,255,255,.45)"}
+  }, "OIL")) : isWall ? /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: size * 0.86,
+      height: size * 0.86,
+      borderRadius: 5,
+      background: "repeating-linear-gradient(0deg, #6b6258, #6b6258 6px, #55503f 6px, #55503f 12px)",
+      border: "2px solid #3c382c",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      color: "#F2EFE6",
+      fontSize: size * 0.24,
+      fontWeight: 700
+    }
+  }, obstacle.hits) : data.p ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(GemShape, {
+    type: data.t,
+    size: size * 0.72
+  }), /*#__PURE__*/React.createElement(PowerupShape, {
+    power: data.p,
+    size: size,
+    color: GEMS[data.t] ? GEMS[data.t].color : "#ffffff"
+  })) : /*#__PURE__*/React.createElement(GemShape, {
+    type: data.t,
+    size: size
+  }), isIce && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      inset: 2,
+      borderRadius: 6,
+      background: "rgba(180,220,245,0.45)",
+      border: "1.5px solid rgba(240,250,255,0.8)",
+      backdropFilter: "blur(0.5px)"
+    }
+  }), isGrass && /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: 0,
+      height: size * (obstacle.hits >= GRASS_HITS ? 0.6 : 0.28),
+      background: obstacle.hits >= GRASS_HITS ? "linear-gradient(0deg, rgba(90,210,110,0.95), rgba(90,210,110,0.2))" : "linear-gradient(0deg, rgba(214,178,84,0.9), rgba(214,178,84,0.15))",
+      borderRadius: "0 0 8px 8px",
+      transition: "height 200ms ease, background 200ms ease"
+    }
+  }), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      left: 0,
+      right: 0,
+      bottom: size * (obstacle.hits >= GRASS_HITS ? 0.52 : 0.22),
+      display: "flex",
+      justifyContent: "space-evenly",
+      padding: "0 3px"
+    }
+  }, Array.from({
+    length: obstacle.hits >= GRASS_HITS ? 5 : 3
+  }).map((_, i) => /*#__PURE__*/React.createElement("div", {
+    key: i,
+    style: {
+      width: 0,
+      height: 0,
+      borderLeft: `${size * 0.045}px solid transparent`,
+      borderRight: `${size * 0.045}px solid transparent`,
+      borderBottom: `${size * (obstacle.hits >= GRASS_HITS ? 0.16 : 0.09)}px solid ${obstacle.hits >= GRASS_HITS ? "#6fe28d" : "#d6b254"}`
+    }
+  }))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      top: 2,
+      left: 2,
+      width: size * 0.28,
+      height: size * 0.28,
+      borderRadius: "50%",
+      background: "rgba(15,15,20,0.75)",
+      border: `1.5px solid ${obstacle.hits >= GRASS_HITS ? "#6fe28d" : "#d6b254"}`,
+      color: "#F2EFE6",
+      display: "flex",
+      alignItems: "center",
+      justifyContent: "center",
+      fontSize: size * 0.17,
+      fontWeight: 700
+    }
+  }, obstacle.hits)), lightRunActive && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute", inset: 0, borderRadius: 7, pointerEvents: "none",
+      background: "radial-gradient(circle at 50% 45%, rgba(4,6,14,.72), rgba(0,0,4,.99))",
+      opacity: illuminated ? 0 : (lightDarkness || 0.84),
+      transition: "opacity 300ms ease",
+      boxShadow: illuminated ? "inset 0 0 18px rgba(255,226,120,.16)" : "inset 0 0 14px rgba(0,0,0,.72)"
+    }
+  }));
+}
+function Stat({
+  label,
+  value,
+  accent
+}) {
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      minWidth: 76,
+      padding: "7px 12px 6px",
+      borderRadius: 13,
+      background: "linear-gradient(145deg, rgba(255,255,255,0.12), rgba(255,255,255,0.045))",
+      border: "1px solid rgba(255,255,255,0.12)",
+      boxShadow: "inset 0 1px 0 rgba(255,255,255,0.10), 0 7px 18px rgba(0,0,0,0.18)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      letterSpacing: 2,
+      color: "#b6b3d8",
+      textTransform: "uppercase"
+    }
+  }, label), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 20,
+      fontWeight: 800,
+      color: accent || "#ffffff"
+    }
+  }, value));
+}
+function ObjectiveBadge({
+  objective,
+  progress,
+  score,
+  specialtyCount,
+  oilProgress,
+  lightProgress,
+  obstacleRemaining
+}) {
+  if (objective.kind === "allIn" || objective.kind === "reverseFlow" || objective.kind === "gravityShift" || objective.kind === "aftershock") return null;
+  if (objective.kind === "specialtyCombo") {
+    const done = (specialtyCount || 0) >= objective.required;
+    const label = comboLabel(objective.combo);
+    return /*#__PURE__*/React.createElement("div",{style:{
+      display:"flex",alignItems:"center",gap:6,padding:"6px 11px",borderRadius:999,
+      background:done?"linear-gradient(135deg,rgba(111,226,141,.28),rgba(77,184,255,.16))":"linear-gradient(135deg,rgba(255,255,255,.10),rgba(255,255,255,.04))",
+      border:`1px solid ${done?"#6fe28d":"rgba(255,211,79,.55)"}`,fontWeight:850,fontSize:12.5
+    }}, label, " ", specialtyCount || 0, "/", objective.required);
+  }
+  if (objective.kind === "obstacle") {
+    const remaining = obstacleRemaining || 0;
+    const done = remaining === 0;
+    const icon = objective.obstacleKind === "ice" ? "🧊" : objective.obstacleKind === "wall" ? "🧱" : "🌱";
+    const label = objective.obstacleKind.toUpperCase();
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display:"flex",alignItems:"center",gap:6,padding:"6px 11px",borderRadius:999,
+        background:done?"linear-gradient(135deg,rgba(111,226,141,.28),rgba(77,184,255,.16))":"linear-gradient(135deg,rgba(255,255,255,.10),rgba(255,255,255,.04))",
+        border:`1px solid ${done?"#6fe28d":"rgba(255,255,255,.22)"}`,fontWeight:850,fontSize:12.5
+      }
+    }, icon, " ", label, " ", remaining, " LEFT");
+  }
+  if (objective.kind === "lightRun") {
+    const done = lightProgress >= objective.required;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display:"flex",alignItems:"center",gap:6,padding:"6px 11px",borderRadius:999,
+        background:done?"linear-gradient(135deg,rgba(255,211,79,.28),rgba(111,226,141,.16))":"linear-gradient(135deg,rgba(255,211,79,.14),rgba(77,184,255,.08))",
+        border:`1px solid ${done?"#ffd34f":"rgba(255,211,79,.55)"}`,color:done?"#fff4b8":"#e6e3f5",fontWeight:850,fontSize:12.5
+      }
+    }, "LIGHT ", lightProgress, "/", objective.required);
+  }
+  if (objective.kind === "starChallenge") {
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 5,
+        padding: "5px 10px",
+        borderRadius: 999,
+        background: "linear-gradient(135deg, rgba(255,211,79,0.18), rgba(176,108,255,0.14))",
+        border: "1px solid rgba(255,211,79,0.65)",
+        color: "#ffd34f",
+        fontWeight: 800,
+        fontSize: 12.5
+      }
+    }, "★★★");
+  }
+  if (objective.kind === "score") {
+    const done = score >= objective.required;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "6px 11px",
+        borderRadius: 999,
+        background: done ? "linear-gradient(135deg, rgba(111,226,141,0.28), rgba(77,184,255,0.16))" : "linear-gradient(135deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04))",
+        border: `1px solid ${done ? "#6fe28d" : "rgba(255,211,79,0.55)"}`,
+        boxShadow: done ? "0 0 12px rgba(111,226,141,0.18)" : "0 4px 10px rgba(0,0,0,0.14)"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12,
+        color: "#ffd34f"
+      }
+    }, "★"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12.5
+      }
+    }, score.toLocaleString(), "/", objective.required.toLocaleString()));
+  }
+  if (objective.kind === "oilRush") {
+    const done = oilProgress >= objective.required;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "6px 11px",
+        borderRadius: 999,
+        background: done ? "linear-gradient(135deg, rgba(111,226,141,0.28), rgba(77,184,255,0.16))" : "linear-gradient(135deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04))",
+        border: `1px solid ${done ? "#6fe28d" : "rgba(255,211,79,0.55)"}`,
+        boxShadow: done ? "0 0 12px rgba(111,226,141,0.18)" : "0 4px 10px rgba(0,0,0,0.14)"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12
+      }
+    }, "🧴"), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12.5
+      }
+    }, oilProgress, "/", objective.required));
+  }
+  if (objective.kind === "specialtyTrigger") {
+    const done = specialtyCount >= objective.required;
+    return /*#__PURE__*/React.createElement("div", {
+      style: {
+        display: "flex",
+        alignItems: "center",
+        gap: 6,
+        padding: "6px 11px",
+        borderRadius: 999,
+        background: done ? "linear-gradient(135deg, rgba(111,226,141,0.28), rgba(77,184,255,0.16))" : "linear-gradient(135deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04))",
+        border: `1px solid ${done ? "#6fe28d" : "rgba(255,211,79,0.55)"}`,
+        boxShadow: done ? "0 0 12px rgba(111,226,141,0.18)" : "0 4px 10px rgba(0,0,0,0.14)"
+      }
+    }, /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 11.5
+      }
+    }, POWER_NAMES[objective.power]), /*#__PURE__*/React.createElement("span", {
+      style: {
+        fontSize: 12.5
+      }
+    }, specialtyCount, "/", objective.required));
+  }
+  const g = GEMS[objective.type];
+  const done = progress >= objective.required;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      alignItems: "center",
+      gap: 6,
+      padding: "6px 11px",
+      borderRadius: 999,
+      background: done ? "linear-gradient(135deg, rgba(111,226,141,0.28), rgba(77,184,255,0.16))" : "linear-gradient(135deg, rgba(255,255,255,0.10), rgba(255,255,255,0.04))",
+      border: `1px solid ${done ? "#6fe28d" : "rgba(255,255,255,0.20)"}`,
+      boxShadow: done ? "0 0 12px rgba(111,226,141,0.18)" : "0 4px 10px rgba(0,0,0,0.14)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      width: 12,
+      height: 12,
+      borderRadius: "50%",
+      background: g.color
+    }
+  }), /*#__PURE__*/React.createElement("span", {
+    style: {
+      fontSize: 12.5
+    }
+  }, progress, "/", objective.required));
+}
+function WelcomeModal({
+  onClose,
+  onRestart,
+  savedLevel,
+  hasSavedRun,
+  bestStars
+}) {
+  const [confirmRestart, setConfirmRestart] = useState(false);
+  const powerCards = [{icon:"→",label:"Arrow",text:"4 in a row"},{icon:"●",label:"Grenade",text:"2×2 square"},{icon:"TNT",label:"TNT",text:"T / L shape"},{icon:"★",label:"Rainbow",text:"5+ in a row"}];
+  const starValues = Object.values(bestStars || {});
+  const totalStars = starValues.reduce((sum, n) => sum + (Number(n) || 0), 0);
+  const threeStarLevels = starValues.filter(n => Number(n) === 3).length;
+  const isReturning = !!hasSavedRun;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "fixed", inset: 0,
+      background: "radial-gradient(circle at 50% 8%, rgba(176,108,255,.34), transparent 32%), radial-gradient(circle at 18% 80%, rgba(77,184,255,.15), transparent 28%), rgba(7,8,17,0.96)",
+      display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16,
+      backdropFilter: "blur(14px)"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      maxWidth: 430, width: "100%", position:"relative", overflow:"hidden",
+      background: "linear-gradient(160deg, rgba(39,44,83,.99), rgba(17,19,42,.99))",
+      border: "1px solid rgba(255,211,79,0.46)", borderRadius: 24, padding: "26px 22px 22px",
+      boxShadow: "0 30px 90px rgba(0,0,0,.72), 0 0 42px rgba(176,108,255,.18)",
+      color: "#F7F5FF", fontFamily: "Inter, ui-rounded, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      maxHeight: "90vh", overflowY: "auto"
+    }
+  }, /*#__PURE__*/React.createElement("div", {style:{position:"absolute",width:190,height:190,borderRadius:"50%",right:-86,top:-100,background:"radial-gradient(circle, rgba(77,184,255,.30), transparent 68%)",pointerEvents:"none"}}),
+  /*#__PURE__*/React.createElement("div", {style:{display:"flex",justifyContent:"center",gap:7,marginBottom:9}}, GEMS.map((g,i)=>/*#__PURE__*/React.createElement("div",{key:i,style:{width:i===3?15:11,height:i===3?15:11,borderRadius:i===3?4:"50%",background:g.color,boxShadow:`0 0 14px ${g.color}`,transform:i===3?"rotate(45deg)":"none"}}))),
+  /*#__PURE__*/React.createElement("div", {style:{fontSize:10,letterSpacing:5,textTransform:"uppercase",color:"#ffd34f",marginBottom:5,textAlign:"center"}}, "Diamond Run"),
+  /*#__PURE__*/React.createElement("h1", {style:{margin:"0 0 5px",fontSize:34,fontWeight:950,letterSpacing:-1.1,textAlign:"center",textShadow:"0 0 24px rgba(176,108,255,.46)"}}, isReturning ? "Welcome Back" : "Ready to Run?"),
+  /*#__PURE__*/React.createElement("div", {style:{fontSize:13.5,color:"#c9c7e7",marginBottom:15,textAlign:"center"}}, isReturning ? `Your run is ready at Level ${savedLevel}.` : "Match fast. Build specials. Chase bigger combos."),
+  isReturning && /*#__PURE__*/React.createElement("div",{style:{display:"grid",gridTemplateColumns:"repeat(3,minmax(0,1fr))",gap:7,marginBottom:15}},
+    /*#__PURE__*/React.createElement("div",{style:{padding:"9px 6px",borderRadius:13,background:"rgba(255,255,255,.065)",border:"1px solid rgba(255,255,255,.10)",textAlign:"center"}}, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,color:"#aaa7ca",textTransform:"uppercase",letterSpacing:1}},"Level"), /*#__PURE__*/React.createElement("div",{style:{fontSize:19,fontWeight:950,color:"#fff"}},savedLevel)),
+    /*#__PURE__*/React.createElement("div",{style:{padding:"9px 6px",borderRadius:13,background:"rgba(255,255,255,.065)",border:"1px solid rgba(255,255,255,.10)",textAlign:"center"}}, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,color:"#aaa7ca",textTransform:"uppercase",letterSpacing:1}},"Stars"), /*#__PURE__*/React.createElement("div",{style:{fontSize:19,fontWeight:950,color:"#ffd34f"}},totalStars," ★")),
+    /*#__PURE__*/React.createElement("div",{style:{padding:"9px 6px",borderRadius:13,background:"rgba(255,255,255,.065)",border:"1px solid rgba(255,255,255,.10)",textAlign:"center"}}, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,color:"#aaa7ca",textTransform:"uppercase",letterSpacing:1}},"3-Star"), /*#__PURE__*/React.createElement("div",{style:{fontSize:19,fontWeight:950,color:"#ffd34f"}},threeStarLevels))
+  ),
+  /*#__PURE__*/React.createElement("div", {style:{display:"grid",gridTemplateColumns:"repeat(2,minmax(0,1fr))",gap:8,marginBottom:14}}, powerCards.map(card => /*#__PURE__*/React.createElement("div", {key:card.label,style:{padding:"9px 10px",borderRadius:14,background:"linear-gradient(145deg,rgba(255,255,255,.10),rgba(255,255,255,.035))",border:"1px solid rgba(255,255,255,.10)",boxShadow:"inset 0 1px 0 rgba(255,255,255,.07)"}}, /*#__PURE__*/React.createElement("div", {style:{fontSize:17,fontWeight:950,color:card.label === "Rainbow" ? "#ffd34f" : "#fff",lineHeight:1}}, card.icon), /*#__PURE__*/React.createElement("div", {style:{fontSize:12.5,fontWeight:800,marginTop:5}}, card.label), /*#__PURE__*/React.createElement("div", {style:{fontSize:10.5,color:"#aaa7ca",marginTop:1}}, card.text)))),
+  /*#__PURE__*/React.createElement("div", {style:{fontSize:12,lineHeight:1.5,color:"#d8d6eb",padding:"10px 11px",borderRadius:14,background:"rgba(8,10,24,.42)",border:"1px solid rgba(255,211,79,.12)"}}, "Tap adjacent gems or swipe to swap. Double-tap a power-up to fire it. Earn up to 3 stars on every level and replay to improve your best result."),
+  /*#__PURE__*/React.createElement("button", {onClick:onClose,style:{marginTop:16,width:"100%",padding:"13px 0",borderRadius:999,border:"1px solid rgba(255,255,255,.6)",background:"linear-gradient(135deg,#ffd34f,#ff8a5b 48%,#b06cff)",color:"#17142b",fontSize:15,fontWeight:950,cursor:"pointer",fontFamily:"inherit",boxShadow:"0 10px 28px rgba(176,108,255,.3)"}}, isReturning ? `Continue Level ${savedLevel}` : "Start Diamond Run"),
+  isReturning && /*#__PURE__*/React.createElement("button", {onClick:()=>setConfirmRestart(v=>!v),style:{marginTop:9,width:"100%",padding:"10px 0",borderRadius:999,border:"1px solid rgba(255,255,255,.15)",background:"rgba(255,255,255,.045)",color:"#c5c2dc",fontSize:12.5,fontWeight:800,cursor:"pointer",fontFamily:"inherit"}}, confirmRestart ? "Cancel Restart" : "Restart Run"),
+  isReturning && confirmRestart && /*#__PURE__*/React.createElement("div",{style:{marginTop:9,padding:"11px 12px",borderRadius:14,background:"rgba(255,92,122,.10)",border:"1px solid rgba(255,92,122,.30)",textAlign:"center"}}, /*#__PURE__*/React.createElement("div",{style:{fontSize:11.5,color:"#e2dff2",lineHeight:1.45}},"Restarting clears your level progress, checkpoints and saved stars."), /*#__PURE__*/React.createElement("button",{onClick:onRestart,style:{marginTop:8,width:"100%",padding:"10px 0",borderRadius:999,border:"1px solid rgba(255,92,122,.7)",background:"linear-gradient(135deg,#ff5c7a,#b06cff)",color:"#fff",fontSize:12.5,fontWeight:900,cursor:"pointer",fontFamily:"inherit"}},"Yes, Restart from Level 1"))
+  ));
+}
+function LightScriptureModal({ onContinue, scripture }) {
+  const verse = scripture || LIGHT_SCRIPTURES[0];
+  return /*#__PURE__*/React.createElement("div", {
+    style:{position:"fixed",inset:0,zIndex:80,display:"flex",alignItems:"center",justifyContent:"center",padding:18,background:"radial-gradient(circle at 50% 44%,rgba(255,226,120,.24),transparent 34%),rgba(5,7,16,.96)",backdropFilter:"blur(12px)"}
+  }, /*#__PURE__*/React.createElement("div", {
+    className:"light-scripture",
+    style:{width:"100%",maxWidth:430,padding:"30px 24px 24px",borderRadius:24,textAlign:"center",background:"linear-gradient(160deg,rgba(37,42,75,.99),rgba(14,17,36,.995))",border:"1px solid rgba(255,226,120,.62)",boxShadow:"0 0 55px rgba(255,211,79,.18),0 28px 80px rgba(0,0,0,.68)",color:"#fff"}
+  }, /*#__PURE__*/React.createElement("div",{style:{fontSize:30,marginBottom:8}},"✨"),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:10,letterSpacing:4,color:"#ffd34f",fontWeight:900,marginBottom:10}},"LIGHT RUSH COMPLETE"),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:22,lineHeight:1.4,fontWeight:850,color:"#fff9d8",margin:"0 auto 12px",maxWidth:360}},`“${verse.text}”`),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:12.5,color:"#c9c7e7",fontWeight:750}},verse.reference," · NIrV"),
+  /*#__PURE__*/React.createElement("button",{onClick:onContinue,style:{marginTop:22,width:"100%",padding:"13px 0",borderRadius:999,border:"1px solid rgba(255,255,255,.68)",background:"linear-gradient(135deg,#fff1a8,#ffd34f 42%,#b06cff)",color:"#17142b",fontSize:14.5,fontWeight:950,cursor:"pointer",fontFamily:"inherit"}},"Continue")));
+}
+
+function CarryExchangeModal({ level, balance, allocation, onAdjust, onContinue, onCancel }) {
+  const nextLevelNumber = level + 1;
+  const nextIsAllIn = nextLevelNumber >= CARRY_START_LEVEL && ((nextLevelNumber - 1) % DIFFICULTY_CYCLE_LENGTH + 1) === 19;
+  const spent = allocation.G * POWERUP_COSTS.G + allocation.arrow * POWERUP_COSTS.arrow + allocation.T * POWERUP_COSTS.T + allocation.R * POWERUP_COSTS.R;
+  const remaining = Math.max(0, balance - spent);
+  const rows = [
+    {kind:"G",label:"Grenade",cost:POWERUP_COSTS.G},
+    {kind:"arrow",label:"Arrow",cost:POWERUP_COSTS.arrow},
+    {kind:"T",label:"TNT",cost:POWERUP_COSTS.T},
+    {kind:"R",label:"Rainbow",cost:POWERUP_COSTS.R}
+  ];
+  return /*#__PURE__*/React.createElement("div", {
+    style:{position:"fixed",inset:0,zIndex:90,display:"flex",alignItems:"center",justifyContent:"center",padding:16,background:"rgba(5,7,16,.96)",backdropFilter:"blur(14px)"}
+  }, /*#__PURE__*/React.createElement("div", {
+    style:{width:"100%",maxWidth:420,maxHeight:"88vh",overflowY:"auto",padding:"24px 20px 20px",borderRadius:24,background:"linear-gradient(160deg,rgba(38,43,78,.995),rgba(14,17,36,.995))",border:"1px solid rgba(255,211,79,.45)",boxShadow:"0 28px 80px rgba(0,0,0,.72),0 0 36px rgba(176,108,255,.16)",color:"#fff"}
+  }, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,letterSpacing:3.5,color:"#ffd34f",fontWeight:900,textAlign:"center"}},nextIsAllIn?"PREPARE FOR ALL-IN":"CARRY OVER"),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:24,fontWeight:950,textAlign:"center",marginTop:5}},nextIsAllIn?`Gear Up for Level ${nextLevelNumber}`:`Ready for Level ${nextLevelNumber}`),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:12.5,lineHeight:1.5,color:"#c9c7e7",textAlign:"center",margin:"8px auto 16px",maxWidth:340}},nextIsAllIn?"Keep every unspent carry move, or trade some of the carry bank for starting power-ups. Your ALL-IN base moves are protected.":"Trade excess moves for starting power-ups, or continue without trading."),
+  /*#__PURE__*/React.createElement("div",{style:{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:14}},
+    /*#__PURE__*/React.createElement("div",{style:{padding:"10px",borderRadius:14,background:"rgba(255,255,255,.06)",textAlign:"center"}},/*#__PURE__*/React.createElement("div",{style:{fontSize:10,color:"#aaa7ca"}},nextIsAllIn?"CARRY BANK":"EXCESS MOVES"),/*#__PURE__*/React.createElement("div",{style:{fontSize:24,fontWeight:950,color:"#fff"}},balance)),
+    /*#__PURE__*/React.createElement("div",{style:{padding:"10px",borderRadius:14,background:"rgba(255,211,79,.08)",border:"1px solid rgba(255,211,79,.18)",textAlign:"center"}},/*#__PURE__*/React.createElement("div",{style:{fontSize:10,color:"#aaa7ca"}},nextIsAllIn?"MOVES KEPT":"UNSPENT"),/*#__PURE__*/React.createElement("div",{style:{fontSize:24,fontWeight:950,color:"#ffd34f"}},remaining))
+  ),
+  /*#__PURE__*/React.createElement("div",{style:{display:"grid",gap:7}},rows.map(row=>/*#__PURE__*/React.createElement("div",{key:row.kind,style:{display:"flex",alignItems:"center",justifyContent:"space-between",padding:"9px 10px",borderRadius:13,background:"rgba(255,255,255,.05)",border:"1px solid rgba(255,255,255,.08)"}},
+    /*#__PURE__*/React.createElement("div",null,/*#__PURE__*/React.createElement("div",{style:{fontSize:13,fontWeight:850}},row.label),/*#__PURE__*/React.createElement("div",{style:{fontSize:10.5,color:"#aaa7ca"}},row.cost," moves")),
+    /*#__PURE__*/React.createElement("div",{style:{display:"flex",alignItems:"center",gap:10}},/*#__PURE__*/React.createElement("button",{onClick:()=>onAdjust(row.kind,-1),disabled:allocation[row.kind]===0,style:{...allocBtnStyle,width:30,height:30,opacity:allocation[row.kind]===0?.3:1}},"−"),/*#__PURE__*/React.createElement("strong",{style:{minWidth:18,textAlign:"center"}},allocation[row.kind]),/*#__PURE__*/React.createElement("button",{onClick:()=>onAdjust(row.kind,1),disabled:remaining<row.cost,style:{...allocBtnStyle,width:30,height:30,opacity:remaining<row.cost?.3:1}},"+"))
+  ))),
+  /*#__PURE__*/React.createElement("button",{onClick:onContinue,style:{marginTop:17,width:"100%",padding:"13px 0",borderRadius:999,border:"1px solid rgba(255,255,255,.65)",background:"linear-gradient(135deg,#ffd34f,#ff8a5b 48%,#b06cff)",color:"#17142b",fontSize:14.5,fontWeight:950,cursor:"pointer",fontFamily:"inherit"}},nextIsAllIn?`Start ALL-IN with ${remaining} carry moves`:`Continue to Level ${nextLevelNumber}`),
+  /*#__PURE__*/React.createElement("button",{onClick:onCancel,style:{marginTop:8,width:"100%",padding:"9px 0",border:0,background:"transparent",color:"#aaa7ca",fontSize:11.5,fontWeight:750,cursor:"pointer",fontFamily:"inherit"}},"Back to level result")));
+}
+
+function EffectsLayer({
+  effects,
+  size
+}) {
+  const cellSpan = size + GRID_GAP;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      inset: 0,
+      pointerEvents: "none",
+      overflow: "hidden",
+      borderRadius: 12
+    }
+  }, effects.map(e => {
+    const cx = GRID_PAD + e.c * cellSpan + size / 2;
+    const cy = GRID_PAD + e.r * cellSpan + size / 2;
+    if (e.power === "H") {
+      const width = COLS * size + (COLS - 1) * GRID_GAP;
+      return /*#__PURE__*/React.createElement("div", {
+        key: e.id,
+        className: "fx-beam",
+        style: {
+          position: "absolute",
+          left: GRID_PAD,
+          top: GRID_PAD + e.r * cellSpan,
+          width,
+          height: size,
+          background: "linear-gradient(90deg, transparent, rgba(110,220,255,0.35), rgba(255,255,255,1), rgba(255,211,79,0.75), transparent)",
+          boxShadow: "0 0 24px rgba(77,184,255,0.9)",
+          borderRadius: 6
+        }
+      });
+    }
+    if (e.power === "V") {
+      const height = ROWS * size + (ROWS - 1) * GRID_GAP;
+      return /*#__PURE__*/React.createElement("div", {
+        key: e.id,
+        className: "fx-beam-v",
+        style: {
+          position: "absolute",
+          left: GRID_PAD + e.c * cellSpan,
+          top: GRID_PAD,
+          width: size,
+          height,
+          background: "linear-gradient(180deg, transparent, rgba(176,108,255,0.35), rgba(255,255,255,1), rgba(255,92,122,0.75), transparent)",
+          boxShadow: "0 0 24px rgba(176,108,255,0.9)",
+          borderRadius: 6
+        }
+      });
+    }
+    if (e.power === "G") {
+      const d = size * 3;
+      return /*#__PURE__*/React.createElement("div", {
+        key: e.id,
+        className: "fx-grenade",
+        style: {
+          position: "absolute",
+          left: cx - d / 2,
+          top: cy - d / 2,
+          width: d,
+          height: d,
+          borderRadius: "50%",
+          background: "radial-gradient(circle, rgba(255,255,255,0.98) 0%, rgba(255,211,79,0.95) 16%, rgba(255,92,122,0.78) 42%, rgba(176,108,255,0.42) 62%, transparent 78%)",
+          filter: "drop-shadow(0 0 16px rgba(255,92,122,0.9))"
+        }
+      });
+    }
+    if (e.power === "T") {
+      const d = size * 5;
+      return /*#__PURE__*/React.createElement("div", {
+        key: e.id,
+        className: "fx-tnt",
+        style: {
+          position: "absolute",
+          left: cx - d / 2,
+          top: cy - d / 2,
+          width: d,
+          height: d,
+          borderRadius: "50%",
+          background: "radial-gradient(circle, rgba(255,255,255,1) 0%, rgba(255,211,79,0.95) 14%, rgba(255,126,76,0.90) 34%, rgba(255,92,122,0.72) 52%, rgba(176,108,255,0.30) 70%, transparent 80%)",
+          filter: "drop-shadow(0 0 20px rgba(255,211,79,0.9))",
+          border: "2px solid rgba(242,239,230,0.6)"
+        }
+      });
+    }
+    if (e.power === "R") {
+      const d = size * 4;
+      return /*#__PURE__*/React.createElement("div", {
+        key: e.id,
+        className: "fx-rainbow",
+        style: {
+          position: "absolute",
+          left: cx - d / 2,
+          top: cy - d / 2,
+          width: d,
+          height: d,
+          borderRadius: "50%",
+          background: "conic-gradient(from 0deg,#ff5c7a,#ffd34f,#6fe28d,#4db8ff,#b06cff,#ff5c7a)",
+          opacity: 0.65
+        }
+      });
+    }
+    return null;
+  }));
+}
+function Match3() {
+  const [showWelcome, setShowWelcome] = useState(true);
+  const [hasSavedRun, setHasSavedRun] = useState(() => {
+    try {
+      return !!localStorage.getItem(SAVE_KEY);
+    } catch (e) {
+      return false;
+    }
+  });
+  const dismissWelcome = () => {
+    setShowWelcome(false);
+  };
+  const [level, setLevel] = useState(1);
+  const [checkpoint, setCheckpoint] = useState(1);
+  const [carried, setCarried] = useState(0);
+  const [excessBalance, setExcessBalance] = useState(0);
+  const [heatPowerupSeed, setHeatPowerupSeed] = useState({
+    G: 0,
+    arrow: 0,
+    T: 0,
+    R: 0
+  });
+  const [powerupAllocation, setPowerupAllocation] = useState({
+    G: 0,
+    arrow: 0,
+    T: 0,
+    R: 0
+  });
+  const [objectives, setObjectives] = useState(() => generateObjectives(1));
+  const [progress, setProgress] = useState(() => Array(GEMS.length).fill(0));
+  const [specialtyProgress, setSpecialtyProgress] = useState({
+    arrow: 0,
+    G: 0,
+    T: 0,
+    R: 0
+  });
+  const [oilProgress, setOilProgress] = useState(0);
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [board, setBoard] = useState(() => makeBoard(computeWeights(generateObjectives(1))));
+  const [selected, setSelected] = useState(null);
+  const [score, setScore] = useState(0);
+  const [heat, setHeat] = useState(0);
+  const [moves, setMoves] = useState(() => baseMovesForLevel(1));
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("Swap gems to match 3 or more");
+  const [status, setStatus] = useState("playing"); // playing | won | lost
+  const [effects, setEffects] = useState([]);
+  const [levelStars, setLevelStars] = useState(0);
+  const [bestStars, setBestStars] = useState({});
+  const [illuminatedTiles, setIlluminatedTiles] = useState(() => new Set());
+  const [showLightScripture, setShowLightScripture] = useState(false);
+  const [showCarryExchange, setShowCarryExchange] = useState(false);
+  const [comboProgress, setComboProgress] = useState({AA:0,arrowT:0,arrowG:0,TT:0,GT:0,GG:0,RR:0,arrowR:0,TR:0,GR:0});
+  const [retryUsed, setRetryUsed] = useState(false);
+  const [chapterPrompt, setChapterPrompt] = useState(null);
+  const [gravityChallengeMoves, setGravityChallengeMoves] = useState(0);
+  const responsiveCellSize = () => {
+    const viewport = typeof window !== "undefined" ? window.innerWidth : 440;
+    const outerGutters = 24; // page padding: 12px on each side
+    const availableBoardWidth = Math.min(416, Math.max(220, viewport - outerGutters));
+    const usableCellWidth = availableBoardWidth - GRID_PAD * 2 - GRID_GAP * (COLS - 1);
+    return Math.max(18, Math.min(36, Math.floor(usableCellWidth / COLS)));
+  };
+  const [cellSize, setCellSize] = useState(() => responsiveCellSize());
+  const effectIdRef = useRef(0);
+  const weightsRef = useRef(computeWeights(objectives));
+  const objectivesRef = useRef(objectives);
+  const progressRef = useRef(progress);
+  const specialtyProgressRef = useRef(specialtyProgress);
+  const oilProgressRef = useRef(0);
+  const movesRef = useRef(moves);
+  const scoreRef = useRef(score);
+  const heatRef = useRef(0); // consecutive successful-move streak, resets on a whiffed swap or new level
+  const heatMultRef = useRef(1); // locked in per-move from heatRef before the move resolves
+  const checkpointRef = useRef(1);
+  const swipeStartRef = useRef(null);
+  const suppressClickRef = useRef(false);
+  const startingMovesRef = useRef(moves);
+  const startingTimeRef = useRef(0);
+  const timeLeftRef = useRef(0);
+  const bestStarsRef = useRef({});
+  const illuminatedRef = useRef(new Set());
+  const grassTouchedRef = useRef(new Set());
+  const lastColorRushRef = useRef(null);
+  const comboProgressRef = useRef({AA:0,arrowT:0,arrowG:0,TT:0,GT:0,GG:0,RR:0,arrowR:0,TR:0,GR:0});
+  const retryEntryRef = useRef({level:1,carry:0,startMoves:null,powerups:null});
+  const gravityChallengeMovesRef = useRef(0);
+
+  // Resumes progress on this same device/browser via localStorage — no
+  // signup needed. This does NOT sync across devices; see reply for that.
+  const saveProgress = (lvl, cp, heatVal, starsMap = bestStarsRef.current) => {
+    try {
+      localStorage.setItem(SAVE_KEY, JSON.stringify({
+        level: lvl,
+        checkpoint: cp,
+        heat: heatVal,
+        bestStars: starsMap
+      }));
+      setHasSavedRun(true);
+    } catch (e) {
+      // localStorage can throw in private-browsing or storage-disabled contexts — fail silently
+    }
+  };
+  const loadSave = () => {
+    try {
+      const raw = localStorage.getItem(SAVE_KEY);
+      if (!raw) return null;
+      const parsed = JSON.parse(raw);
+      if (typeof parsed.level === "number" && parsed.level >= 1) return parsed;
+    } catch (e) {
+      // corrupted or inaccessible save — treat as no save
+    }
+    return null;
+  };
+  useEffect(() => {
+    const updateCellSize = () => setCellSize(responsiveCellSize());
+    window.addEventListener("resize", updateCellSize);
+    window.addEventListener("orientationchange", updateCellSize);
+    updateCellSize();
+    return () => {
+      window.removeEventListener("resize", updateCellSize);
+      window.removeEventListener("orientationchange", updateCellSize);
+    };
+  }, []);
+  useEffect(() => {
+    weightsRef.current = computeWeights(objectives);
+    objectivesRef.current = objectives;
+  }, [objectives]);
+
+  // Restore a saved game on mount, before the first paint, so there's no
+  // visible flash of level 1 before switching to the resumed level.
+  useLayoutEffect(() => {
+    const saved = loadSave();
+    if (!saved) return;
+    setCheckpoint(saved.checkpoint || 1);
+    checkpointRef.current = saved.checkpoint || 1;
+    heatRef.current = saved.heat || 0;
+    setHeat(saved.heat || 0);
+    const restoredStars = saved.bestStars && typeof saved.bestStars === "object" ? saved.bestStars : {};
+    bestStarsRef.current = restoredStars;
+    setBestStars(restoredStars);
+    startLevel(saved.level, 0, null);
+  }, []);
+  const sleep = ms => new Promise(res => setTimeout(res, ms));
+  const addEffects = list => {
+    if (!list.length) return;
+    const withIds = list.map(e => ({
+      ...e,
+      id: ++effectIdRef.current
+    }));
+    setEffects(prev => [...prev, ...withIds]);
+    withIds.forEach(e => {
+      setTimeout(() => {
+        setEffects(prev => prev.filter(x => x.id !== e.id));
+      }, 650);
+    });
+  };
+  const addProgress = counts => {
+    setProgress(prev => {
+      const next = prev.map((v, i) => v + counts[i]);
+      progressRef.current = next;
+      return next;
+    });
+  };
+  const addSpecialtyProgress = list => {
+    if (!list.length) return;
+    setSpecialtyProgress(prev => {
+      const next = {
+        ...prev
+      };
+      list.forEach(e => {
+        const bucket = specialtyBucket(e.power);
+        next[bucket] = (next[bucket] || 0) + 1;
+      });
+      specialtyProgressRef.current = next;
+      return next;
+    });
+  };
+  const specialtyBucket = power => (power === "H" || power === "V" || power === "arrow") ? "arrow" : power;
+  const specialtyCountFor = power => {
+    if (power === "any") return Object.values(specialtyProgressRef.current).reduce((a,b)=>a+b,0);
+    return specialtyProgressRef.current[specialtyBucket(power)] || 0;
+  };
+  const registerDirectCombo = (p1,p2) => {
+    const a=specialtyBucket(p1), b=specialtyBucket(p2);
+    let combo=null;
+    if (a==="arrow"&&b==="arrow") combo="AA";
+    else if ((a==="arrow"&&b==="T")||(a==="T"&&b==="arrow")) combo="arrowT";
+    else if ((a==="arrow"&&b==="G")||(a==="G"&&b==="arrow")) combo="arrowG";
+    else if (a==="T"&&b==="T") combo="TT";
+    else if ((a==="G"&&b==="T")||(a==="T"&&b==="G")) combo="GT";
+    else if (a==="G"&&b==="G") combo="GG";
+    else if (a==="R"&&b==="R") combo="RR";
+    else if ((a==="arrow"&&b==="R")||(a==="R"&&b==="arrow")) combo="arrowR";
+    else if ((a==="T"&&b==="R")||(a==="R"&&b==="T")) combo="TR";
+    else if ((a==="G"&&b==="R")||(a==="R"&&b==="G")) combo="GR";
+    if (!combo) return;
+    comboProgressRef.current={...comboProgressRef.current,[combo]:(comboProgressRef.current[combo]||0)+1};
+    setComboProgress(comboProgressRef.current);
+  };
+  const chapterPromptForLevel = lvl => {
+    if (lvl === 31) return "The rules are familiar. The rhythm is not. Ready for what comes next?";
+    if (lvl === 81) return "A new stretch begins. From here, every decision carries a little more weight.";
+    if ((lvl-1)%20 !== 0 || lvl === 1) return null;
+    const chapter=Math.floor((lvl-1)/20)+1;
+    const prompts = [
+      "The board has learned your habits. Time to learn its new ones.",
+      "Same diamonds. Sharper choices.",
+      "The run deepens. Keep your eyes open.",
+      "You know the language now. The board is about to change its accent.",
+      "Familiar patterns. Less familiar consequences.",
+      "The next chapter does not announce every danger.",
+      "Confidence helps. Attention helps more.",
+      "The board is getting clever. Stay cleverer.",
+      "You have come too far for autopilot.",
+      "The final chapters reward patience, timing and nerve."
+    ];
+    return `Chapter ${chapter} — ${prompts[Math.min(chapter-2,prompts.length-1)]}`;
+  };
+  const addOilProgress = count => {
+    if (!count) return;
+    setOilProgress(prev => {
+      const next = prev + count;
+      oilProgressRef.current = next;
+      return next;
+    });
+  };
+  const illuminateCells = cellsSet => {
+    if (!objectivesRef.current.some(o => o.kind === "lightRun") || !cellsSet || cellsSet.size === 0) return;
+    const next = new Set(illuminatedRef.current);
+    cellsSet.forEach(k => next.add(k));
+    illuminatedRef.current = next;
+    setIlluminatedTiles(next);
+  };
+  const markGrassTouched = cells => {
+    if (!cells || !cells.size) return;
+    cells.forEach(k => grassTouchedRef.current.add(k));
+  };
+  const growIgnoredGrass = currentBoard => {
+    let next = cloneBoard(currentBoard);
+    const ignored = [];
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      const d = next[r][c];
+      if (!d || !d.obstacle || d.obstacle.kind !== "grass") continue;
+      const k = key(r,c);
+      if (!grassTouchedRef.current.has(k)) {
+        ignored.push([r,c]);
+        if (d.obstacle.hits < GRASS_HITS) {
+          next[r][c] = {...d, obstacle:{kind:"grass", hits:GRASS_HITS}};
+        }
+      }
+    }
+    if (ignored.length) {
+      const candidates = [];
+      ignored.forEach(([r,c]) => {
+        [[r-1,c],[r+1,c],[r,c-1],[r,c+1]].forEach(([rr,cc]) => {
+          if (rr < 0 || rr >= ROWS || cc < 0 || cc >= COLS) return;
+          const d = next[rr][cc];
+          if (d && d.t !== null && !d.obstacle) candidates.push([rr,cc]);
+        });
+      });
+      if (candidates.length) {
+        const [rr,cc] = candidates[Math.floor(Math.random() * candidates.length)];
+        next[rr][cc] = {...next[rr][cc], obstacle:{kind:"grass", hits:GRASS_HITS}};
+      }
+    }
+    grassTouchedRef.current = new Set();
+    return next;
+  };
+  const spreadIceAfterMove = currentBoard => {
+    const cyclePos=(level-1)%20+1;
+    const chapter=Math.floor((level-1)/20);
+    if (cyclePos !== 6 || chapter < 2) return currentBoard;
+    if (Math.random() > Math.min(.50,.16+chapter*.05)) return currentBoard;
+
+    const candidates=[];
+    for (let r=0;r<ROWS;r++) for (let c=0;c<COLS;c++) {
+      const d=currentBoard[r][c];
+      if (!d || !d.obstacle || d.obstacle.kind!=="ice") continue;
+      [[r-1,c],[r+1,c],[r,c-1],[r,c+1]].forEach(([rr,cc])=>{
+        if (rr<0||rr>=ROWS||cc<0||cc>=COLS) return;
+        const n=currentBoard[rr][cc];
+        if (n && n.t!==null && !n.obstacle && !n.bonus) candidates.push([rr,cc]);
+      });
+    }
+    if (!candidates.length) return currentBoard;
+    const [r,c]=candidates[Math.floor(Math.random()*candidates.length)];
+    const next=cloneBoard(currentBoard);
+    next[r][c]={...next[r][c],obstacle:{kind:"ice",hits:ICE_HITS}};
+    return next;
+  };
+  const isReverseFlowActive = () => {
+    if (objectivesRef.current.some(o => o.kind === "reverseFlow")) return true;
+    if (objectivesRef.current.some(o => o.kind === "gravityShift")) {
+      const used=gravityChallengeMovesRef.current;
+      // Move 1-3 ↓, 4-6 ↑, 7-8 ↓, 9-10 ↑.
+      return (used>=3 && used<6) || (used>=8 && used<10);
+    }
+    return false;
+  };
+  const settleBoard = boardToSettle => {
+    const reverse = isReverseFlowActive();
+    let next = applyGravity(boardToSettle, weightsRef.current, reverse);
+    if (reverse) return next;
+
+    let collected = 0;
+    // Any Oil Drop that reaches the bottom exits the board immediately.
+    let oilPasses = 0;
+    while (oilPasses++ < ROWS + 2) {
+      let found = false;
+      for (let c = 0; c < COLS; c++) {
+        const d = next[ROWS - 1][c];
+        if (d && d.bonus === "oil") {
+          next[ROWS - 1][c] = null;
+          collected++;
+          found = true;
+        }
+      }
+      if (!found) break;
+      next = applyGravity(next, weightsRef.current, false);
+    }
+    if (collected) {
+      addOilProgress(collected);
+      decMoves(OIL_DROP_BONUS_MOVES * collected);
+      addScore(OIL_DROP_BONUS_SCORE * collected);
+      setMessage(`Oil Drop delivered! ${collected} collected · +${OIL_DROP_BONUS_MOVES * collected} moves`);
+    }
+    return next;
+  };
+  const addScore = amount => {
+    setScore(s => {
+      const next = s + Math.round(amount * heatMultRef.current);
+      scoreRef.current = next;
+      return next;
+    });
+  };
+
+  // Heat tiers: a longer streak of successful moves (no whiffed swaps)
+  // boosts the score multiplier on your NEXT move.
+  const heatMultiplier = h => h >= 10 ? 2 : h >= 6 ? 1.5 : h >= 3 ? 1.25 : 1;
+  const registerSuccessfulMove = () => {
+    if (level < HEAT_START_LEVEL) return;
+    heatRef.current += 1;
+    setHeat(heatRef.current);
+  };
+  const resetHeat = () => {
+    heatRef.current = 0;
+    setHeat(0);
+  };
+  const decMoves = delta => {
+    movesRef.current += delta;
+    setMoves(movesRef.current);
+  };
+  const objectivesMet = (boardToCheck = board) => objectivesRef.current.every(o => {
+    if (o.kind === "starChallenge" || o.kind === "reverseFlow" || o.kind === "gravityShift" || o.kind === "aftershock" || o.kind === "allIn") return true;
+    if (o.kind === "obstacle") return countObstacles(boardToCheck, o.obstacleKind) === 0;
+    if (o.kind === "lightRun") return illuminatedRef.current.size >= o.required;
+    if (o.kind === "score") return scoreRef.current >= o.required;
+    if (o.kind === "oilRush") return oilProgressRef.current >= o.required;
+    if (o.kind === "specialtyCombo") return (comboProgressRef.current[o.combo] || 0) >= o.required;
+    if (o.kind === "specialtyTrigger") return specialtyCountFor(o.power) >= o.required;
+    return progressRef.current[o.type] >= o.required; // color and timedColor both track by color
+  });
+
+  // Countdown timer for timedColor/oilRush bonus levels — the only levels
+  // where failure is time-based rather than move-based.
+  useEffect(() => {
+    const isTimed = objectives.some(o => o.kind === "timedColor" || (o.kind === "oilRush" && o.timeLimitSeconds));
+    if (!isTimed || status !== "playing") return;
+    const id = setInterval(() => {
+      setTimeLeft(t => {
+        const next = t - 1;
+        timeLeftRef.current = Math.max(0, next);
+        if (next <= 0) {
+          if (!objectivesMet()) setStatus("lost");
+          return 0;
+        }
+        return next;
+      });
+    }, 1000);
+    return () => clearInterval(id);
+  }, [objectives, status]);
+  const clearAndScore = useCallback(async (startBoard, initialGroups, swapHints) => {
+    let current = cloneBoard(startBoard);
+    let groups = initialGroups;
+    let chain = 0;
+    while (groups && groups.length > 0) {
+      chain++;
+      const newSpecials = {};
+      let baseClear = new Set();
+      groups.forEach(g => {
+        if (g.power) {
+          let anchor = pickAnchor(g.cells, swapHints);
+          if (current) {
+            const [ar, ac] = anchor.split("-").map(Number);
+            if (current[ar] && current[ar][ac] && current[ar][ac].bonus === "oil") {
+              anchor = g.cells.find(k => {
+                const [rr, cc] = k.split("-").map(Number);
+                return current[rr] && current[rr][cc] && current[rr][cc].bonus !== "oil";
+              }) || anchor;
+            }
+          }
+          newSpecials[anchor] = {
+            t: g.type,
+            p: g.power
+          };
+          g.cells.forEach(k => {
+            if (k !== anchor) baseClear.add(k);
+          });
+        } else {
+          g.cells.forEach(k => baseClear.add(k));
+        }
+      });
+      // A specialty formation counts every gem used to make it, including
+      // the anchor that survives as the new specialty. In Light Run, every
+      // participating formation tile is illuminated too.
+      const formationCounts = Array(GEMS.length).fill(0);
+      groups.forEach(g => {
+        if (!g.power) return;
+        g.cells.forEach(k => {
+          const [rr,cc]=k.split("-").map(Number);
+          const d=current[rr]&&current[rr][cc];
+          if (d && d.t!==null && d.t!==undefined) formationCounts[d.t]++;
+        });
+        illuminateCells(g.cells);
+      });
+
+      let finalClear = expandClears(current, baseClear);
+      Object.keys(newSpecials).forEach(k => finalClear.delete(k));
+      const resolved1 = processClear(current, finalClear);
+      markGrassTouched(resolved1.grassTouched);
+      current = resolved1.board;
+      finalClear = resolved1.clearSet;
+      illuminateCells(finalClear);
+      const clearCounts=tally(current, finalClear);
+      // finalClear already includes every non-anchor formation gem. Add only
+      // one anchor gem per newly created specialty so 4-match=4, 5-match=5.
+      Object.keys(newSpecials).forEach(k=>{
+        const [rr,cc]=k.split("-").map(Number);
+        const d=current[rr]&&current[rr][cc];
+        if (d && d.t!==null && d.t!==undefined) clearCounts[d.t]++;
+      });
+      addProgress(clearCounts);
+      addEffects(triggeredSpecials(current, finalClear));
+      addSpecialtyProgress(triggeredSpecials(current, finalClear));
+      addScore(finalClear.size * 100 * chain);
+      if (chain > 1 && !resolved1.bonuses.length) setMessage(`Combo x${chain}!`);
+      const next = cloneBoard(current);
+      finalClear.forEach(k => {
+        const [r, c] = k.split("-").map(Number);
+        next[r][c] = null;
+      });
+      Object.entries(newSpecials).forEach(([k, val]) => {
+        const [r, c] = k.split("-").map(Number);
+        next[r][c] = cell(val.t, val.p);
+      });
+      setBoard(next);
+      await sleep(125);
+      current = settleBoard(next);
+      setBoard(current);
+      await sleep(170);
+      swapHints = null;
+      groups = analyzeBoard(current).groups;
+    }
+    if (chain <= 1) setMessage("Swap gems to match 3 or more");
+    if (!hasAnyMove(current)) {
+      current = shuffleBoard(current);
+      setBoard(current);
+      setMessage("Board shuffled — no moves were left");
+    }
+    return current;
+  }, []);
+  const doubleRainbowClear = useCallback(async startBoard => {
+    let current = cloneBoard(startBoard);
+    for (let pass = 0; pass < 2; pass++) {
+      const allCells = new Set();
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (current[r][c]) allCells.add(key(r, c));
+      let finalClear = expandClears(current, allCells);
+      const resolvedDouble = processClear(current, finalClear);
+      markGrassTouched(resolvedDouble.grassTouched);
+      current = resolvedDouble.board;
+      finalClear = resolvedDouble.clearSet;
+      illuminateCells(finalClear);
+      addProgress(tally(current, finalClear));
+      addEffects(triggeredSpecials(current, finalClear));
+      addSpecialtyProgress(triggeredSpecials(current, finalClear));
+      addScore(finalClear.size * 300);
+      const cleared = cloneBoard(current);
+      finalClear.forEach(k => {
+        const [r, c] = k.split("-").map(Number);
+        cleared[r][c] = null;
+      });
+      setBoard(cleared);
+      await sleep(125);
+      current = settleBoard(cleared);
+      setBoard(current);
+      await sleep(170);
+    }
+    setMessage("Double rainbow — board cleared twice!");
+    return current;
+  }, []);
+  const rainbowRandomClear = useCallback(async (startBoard, rainbowKey, forcedType) => {
+    const targetType = forcedType !== undefined ? forcedType : Math.floor(Math.random() * GEMS.length);
+    const seed = new Set([rainbowKey]);
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (startBoard[r][c] && startBoard[r][c].t === targetType) seed.add(key(r, c));
+    let finalClear = expandClears(startBoard, seed);
+    const resolved3 = processClear(startBoard, finalClear);
+      markGrassTouched(resolved3.grassTouched);
+    let workingBoard = resolved3.board;
+    finalClear = resolved3.clearSet;
+    // Light follows the actual Rainbow effect footprint: Rainbow + plain gem
+    // lights the selected color cells it affects, not the whole board.
+    illuminateCells(finalClear);
+    addProgress(tally(workingBoard, finalClear));
+    addEffects(triggeredSpecials(workingBoard, finalClear));
+    addSpecialtyProgress(triggeredSpecials(workingBoard, finalClear));
+    addScore(finalClear.size * 100);
+    setMessage(forcedType !== undefined ? "Rainbow clear!" : "Rainbow clear — random color!");
+    const cleared = cloneBoard(workingBoard);
+    finalClear.forEach(k => {
+      const [r, c] = k.split("-").map(Number);
+      cleared[r][c] = null;
+    });
+    setBoard(cleared);
+    await sleep(125);
+    let current = settleBoard(cleared);
+    setBoard(current);
+    await sleep(170);
+    const groups = analyzeBoard(current).groups;
+    current = await clearAndScore(current, groups, null);
+    return current;
+  }, [clearAndScore]);
+  const rainbowDuplicateEffect = useCallback(async (startBoard, rainbowKey, targetColor, specialtyPower) => {
+    const next = cloneBoard(startBoard);
+    const affected = [];
+    for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) {
+      if (next[r][c] && next[r][c].t === targetColor) {
+        next[r][c] = cell(targetColor, specialtyPower);
+        affected.push(key(r, c));
+      }
+    }
+    const seed = new Set([rainbowKey, ...affected]);
+    let finalClear = expandClears(next, seed, COMBO_BLAST_RADIUS); // rainbow + specialty is a two-power-up combo
+    const resolved4 = processClear(next, finalClear);
+      markGrassTouched(resolved4.grassTouched);
+    const workingBoard4 = resolved4.board;
+    finalClear = resolved4.clearSet;
+    illuminateCells(finalClear);
+    addProgress(tally(workingBoard4, finalClear));
+    addEffects(triggeredSpecials(workingBoard4, finalClear));
+    addSpecialtyProgress(triggeredSpecials(workingBoard4, finalClear));
+    addScore(finalClear.size * 300);
+    setMessage("Rainbow duplicate combo!");
+    const cleared = cloneBoard(workingBoard4);
+    finalClear.forEach(k => {
+      const [r, c] = k.split("-").map(Number);
+      cleared[r][c] = null;
+    });
+    setBoard(cleared);
+    await sleep(125);
+    let current = settleBoard(cleared);
+    setBoard(current);
+    await sleep(170);
+    const groups = analyzeBoard(current).groups;
+    current = await clearAndScore(current, groups, null);
+    return current;
+  }, [clearAndScore]);
+
+  // Consume remaining moves one gem at a time (specialty gems first) for bonus points.
+  const runBonusClear = useCallback(async (startBoard, movesLeft) => {
+    let current = cloneBoard(startBoard);
+    for (let i = 0; i < movesLeft; i++) {
+      const isLocked = d => d && d.obstacle && (d.obstacle.kind === "ice" || d.obstacle.kind === "wall");
+      let target = null;
+      outer: for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (current[r][c] && current[r][c].p && !isLocked(current[r][c])) {
+        target = [r, c];
+        break outer;
+      }
+      if (!target) {
+        outer2: for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (current[r][c] && !isLocked(current[r][c])) {
+          target = [r, c];
+          break outer2;
+        }
+      }
+      if (!target) break;
+      const [r, c] = target;
+      const data = current[r][c];
+      let clearSet;
+      if (data.p && data.p !== "R") {
+        const seed = new Set([key(r, c), ...areaCells(data.p, r, c)]);
+        clearSet = expandClears(current, seed);
+      } else {
+        clearSet = new Set([key(r, c)]);
+      }
+      const resolvedB = processClear(current, clearSet);
+      markGrassTouched(resolvedB.grassTouched);
+      current = resolvedB.board;
+      clearSet = resolvedB.clearSet;
+      addEffects(triggeredSpecials(current, clearSet));
+      addSpecialtyProgress(triggeredSpecials(current, clearSet));
+      const next = cloneBoard(current);
+      clearSet.forEach(k => {
+        const [rr, cc] = k.split("-").map(Number);
+        next[rr][cc] = null;
+      });
+      current = next;
+      setBoard(current);
+      addScore(clearSet.size * BONUS_POINTS_PER_GEM);
+      setMessage(`Bonus blast! ${movesLeft - i - 1} moves left to convert`);
+      await sleep(180);
+    }
+    return current;
+  }, []);
+  const calculateLevelStars = isTimedLevel => {
+    const ratio = isTimedLevel
+      ? (startingTimeRef.current > 0 ? timeLeftRef.current / startingTimeRef.current : 0)
+      : (startingMovesRef.current > 0 ? movesRef.current / startingMovesRef.current : 0);
+    if (ratio >= 0.35) return 3;
+    if (ratio >= 0.15) return 2;
+    return 1;
+  };
+  const recordStars = stars => {
+    const previous = bestStarsRef.current[level] || 0;
+    if (stars <= previous) return;
+    const next = { ...bestStarsRef.current, [level]: stars };
+    bestStarsRef.current = next;
+    setBestStars(next);
+    saveProgress(level, checkpointRef.current, heatRef.current, next);
+  };
+  const nearGoalMessage = boardToCheck => {
+    const pending=[];
+    objectivesRef.current.forEach(o=>{
+      if ((o.kind==="color"||o.kind==="timedColor") && (progressRef.current[o.type]||0)<o.required) {
+        const left=o.required-(progressRef.current[o.type]||0);
+        pending.push({rank:left,text:`${left} more ${GEM_NAMES[o.type]} Gem${left===1?"":"s"} needed`});
+      } else if (o.kind==="score" && scoreRef.current<o.required) {
+        const left=o.required-scoreRef.current;
+        pending.push({rank:left/1000,text:`${left.toLocaleString()} points more`});
+      } else if (o.kind==="oilRush" && oilProgressRef.current<o.required) {
+        const left=o.required-oilProgressRef.current;
+        pending.push({rank:left*10,text:`${left} Oil Drop${left===1?"":"s"} left`});
+      } else if (o.kind==="obstacle") {
+        const left=countObstacles(boardToCheck,o.obstacleKind);
+        if (left) pending.push({rank:left*10,text:`${left} ${o.obstacleKind}${left===1?"":"s"} left`});
+      } else if (o.kind==="specialtyTrigger") {
+        const got=specialtyCountFor(o.power);
+        if (got<o.required) {
+          const left=o.required-got;
+          pending.push({rank:left*8,text:`${left} more ${POWER_NAMES[o.power]} activation${left===1?"":"s"} needed`});
+        }
+      } else if (o.kind==="specialtyCombo") {
+        const got=comboProgressRef.current[o.combo]||0;
+        if (got<o.required) {
+          const left=o.required-got;
+          const label=comboLabel(o.combo);
+          pending.push({rank:left*8,text:`${left} more ${label} combo${left===1?"":"s"} needed`});
+        }
+      }
+    });
+    pending.sort((a,b)=>a.rank-b.rank);
+    return pending.length?pending[0].text:"";
+  };
+  const finishTurn = useCallback(async currentBoard => {
+    registerSuccessfulMove();
+    const gravityChallenge=objectivesRef.current.some(o=>o.kind==="gravityShift");
+    if (gravityChallenge) {
+      gravityChallengeMovesRef.current += 1;
+      setGravityChallengeMoves(gravityChallengeMovesRef.current);
+    }
+    currentBoard = growIgnoredGrass(currentBoard);
+    currentBoard = spreadIceAfterMove(currentBoard);
+    setBoard(currentBoard);
+    const isTimedLevel = objectivesRef.current.some(o => o.kind === "timedColor" || (o.kind === "oilRush" && o.timeLimitSeconds));
+    const won = objectivesMet(currentBoard);
+    if (!won && gravityChallenge && gravityChallengeMovesRef.current >= GRAVITY_SHIFT_MOVE_LIMIT) {
+      setMessage("Gravity Shift challenge ended — target not met within 10 moves");
+      resetHeat();
+      setStatus("lost");
+      return;
+    }
+    if (!won) {
+      const hint=nearGoalMessage(currentBoard);
+      if (gravityChallenge) {
+        const used=gravityChallengeMovesRef.current;
+        if (used===3) setMessage("GRAVITY SHIFT ↑");
+        else if (used===6) setMessage("GRAVITY SHIFT ↓");
+        else if (used===8) setMessage("GRAVITY SHIFT ↑");
+        else if (hint) setMessage(hint);
+      } else if (hint) {
+        setMessage(hint);
+      }
+      // Un-triggered grenades nudge toward whatever helps clear the level.
+      const repositioned = repositionGrenades(currentBoard, objectivesRef.current, progressRef.current);
+      if (repositioned !== currentBoard) {
+        currentBoard = repositioned;
+        setBoard(repositioned);
+        await sleep(120);
+        const hopGroups = analyzeBoard(currentBoard).groups;
+        if (hopGroups.length) {
+          // A passive Grenade hop is board movement, not a second player move.
+          // Resolve the match through the existing cascade engine without
+          // charging another move or growing Grass again.
+          currentBoard = await clearAndScore(currentBoard, hopGroups, null);
+          setBoard(currentBoard);
+        }
+      }
+    }
+    const wonAfterGrenadeHop = objectivesMet(currentBoard);
+    if (wonAfterGrenadeHop) {
+      let finalBoard = currentBoard;
+      const earnedStars = calculateLevelStars(isTimedLevel);
+      setLevelStars(earnedStars);
+      const isStarChallenge = objectivesRef.current.some(o => o.kind === "starChallenge");
+      if (isStarChallenge && earnedStars < 3) {
+        setMessage(`You earned ${earnedStars} star${earnedStars === 1 ? "" : "s"} — 3 are required`);
+        setStatus("starfail");
+        return;
+      }
+      recordStars(earnedStars);
+      const leftoverMoves = movesRef.current; // snapshot — used for both the bonus clear and carry/excess math
+      if (leftoverMoves > 0 && !isTimedLevel) {
+        heatMultRef.current = 1; // the end-of-level auto-clear isn't a player move — no heat bonus
+        finalBoard = await runBonusClear(currentBoard, leftoverMoves);
+        movesRef.current = 0;
+        setMoves(0);
+      }
+      let carry = 0;
+      let excess = 0;
+      if (level >= CARRY_START_LEVEL && !isTimedLevel) {
+        const cap = carryCapForLevel(level);
+        carry = Math.min(leftoverMoves, cap);
+        excess = level <= 80 ? Math.max(0,leftoverMoves-cap) : 0;
+      }
+      setCarried(carry);
+      setExcessBalance(excess);
+      setPowerupAllocation({
+        G: 0,
+        arrow: 0,
+        T: 0,
+        R: 0
+      });
+      const {
+        allocation: heatAlloc,
+        spent: heatSpent
+      } = heatToPowerups(heatRef.current);
+      heatRef.current -= heatSpent;
+      setHeat(heatRef.current);
+      setHeatPowerupSeed(heatAlloc);
+      if (objectivesRef.current.some(o => o.kind === "lightRun") && !objectivesRef.current.some(o => o.kind === "allIn")) {
+        setBusy(true);
+        setMessage("Light Run complete — every tile is shining!");
+        await sleep(520);
+        setShowLightScripture(true);
+        setBusy(false);
+      }
+      setRetryUsed(false);
+      setStatus("won");
+    } else if (!isTimedLevel && movesRef.current <= 0) {
+      resetHeat(); // running out of moves breaks the streak, same as a whiffed swap
+      setStatus("lost");
+    }
+  }, [level, runBonusClear]);
+  const trySwap = useCallback(async (r1, c1, r2, c2) => {
+    if (busy || status !== "playing") return;
+    const dr = Math.abs(r1 - r2),
+      dc = Math.abs(c1 - c2);
+    if (dr + dc !== 1) {
+      setSelected({
+        r: r2,
+        c: c2
+      });
+      return;
+    }
+    setSelected(null);
+    const a = board[r1][c1],
+      b = board[r2][c2];
+    const swapped = cloneBoard(board);
+    swapped[r1][c1] = b;
+    swapped[r2][c2] = a;
+    heatMultRef.current = heatMultiplier(heatRef.current);
+    const bothRainbow = a.p === "R" && b.p === "R";
+    const oneRainbow = a.p === "R" !== (b.p === "R");
+    if (bothRainbow) {
+      registerDirectCombo("R","R");
+      setBusy(true);
+      setBoard(swapped);
+      decMoves(-1);
+      await sleep(125);
+      const finalBoard = await doubleRainbowClear(swapped);
+      setBusy(false);
+      await finishTurn(finalBoard);
+      return;
+    }
+    if (oneRainbow) {
+      const rainbowIsA = a.p === "R";
+      const rainbowKey = rainbowIsA ? key(r2, c2) : key(r1, c1);
+      const partner = rainbowIsA ? b : a;
+      if (partner.p && partner.p !== "R") registerDirectCombo("R",partner.p);
+      setBusy(true);
+      setBoard(swapped);
+      decMoves(-1);
+      await sleep(125);
+      let finalBoard;
+      if (partner.p && partner.p !== "R") {
+        finalBoard = await rainbowDuplicateEffect(swapped, rainbowKey, partner.t, partner.p);
+      } else {
+        finalBoard = await rainbowRandomClear(swapped, rainbowKey, partner.t);
+      }
+      setBusy(false);
+      await finishTurn(finalBoard);
+      return;
+    }
+    const aIsSpecial = a.p && a.p !== "R";
+    const bIsSpecial = b.p && b.p !== "R";
+    const bothSpecial = aIsSpecial && bIsSpecial;
+    if (bothSpecial) registerDirectCombo(a.p,b.p);
+    if (aIsSpecial || bIsSpecial) {
+      setBusy(true);
+      setBoard(swapped);
+      decMoves(-1);
+      await sleep(125);
+      const comboRadius = bothSpecial ? COMBO_BLAST_RADIUS : undefined;
+      let seedArr = [key(r1, c1), key(r2, c2)];
+
+      if (bothSpecial) {
+        const pa=specialtyBucket(a.p), pb=specialtyBucket(b.p);
+        const centerR=r2, centerC=c2;
+
+        if (pa==="arrow" && pb==="arrow") {
+          // Arrow + Arrow: one full row + one full column, direction ignored.
+          seedArr=[];
+          for (let cc=0;cc<COLS;cc++) seedArr.push(key(centerR,cc));
+          for (let rr=0;rr<ROWS;rr++) seedArr.push(key(rr,centerC));
+        } else if ((pa==="arrow"&&pb==="T")||(pa==="T"&&pb==="arrow")) {
+          // Arrow + TNT: 3 full rows + 3 full columns.
+          seedArr=[];
+          for (let rr=Math.max(0,centerR-1);rr<=Math.min(ROWS-1,centerR+1);rr++)
+            for (let cc=0;cc<COLS;cc++) seedArr.push(key(rr,cc));
+          for (let cc=Math.max(0,centerC-1);cc<=Math.min(COLS-1,centerC+1);cc++)
+            for (let rr=0;rr<ROWS;rr++) seedArr.push(key(rr,cc));
+        } else if (pa==="T" && pb==="T") {
+          // TNT + TNT: 7x7 in place.
+          seedArr=[...areaCells("T",centerR,centerC,COMBO_BLAST_RADIUS)];
+        } else if ((pa==="G"&&pb==="T")||(pa==="T"&&pb==="G")) {
+          // Grenade + TNT: travel together to a useful target, then 7x7.
+          const gr = pa==="G" ? r2 : r1;
+          const gc = pa==="G" ? c2 : c1;
+          const target=grenadeTargetCell(swapped,gr,gc) || [centerR,centerC];
+          const [tr,tc]=target;
+          const preview=cloneBoard(swapped);
+          preview[r1][c1]=null; preview[r2][c2]=null;
+          preview[tr][tc]=cell(a.t===null?0:a.t,"T");
+          setBoard(preview);
+          setMessage("Grenade + TNT — target locked!");
+          await sleep(240);
+          seedArr=[...areaCells("T",tr,tc,COMBO_BLAST_RADIUS)];
+        } else if (pa==="G" && pb==="G") {
+          // Grenade + Grenade: split into three targeted 3x3 strikes.
+          const targets=[];
+          const candidates=[];
+          for (let rr=0;rr<ROWS;rr++) for (let cc=0;cc<COLS;cc++) {
+            const d=swapped[rr][cc];
+            if (!d) continue;
+            let priority=d.obstacle?0:1;
+            candidates.push({r:rr,c:cc,priority,dist:Math.min(Math.abs(rr-r1)+Math.abs(cc-c1),Math.abs(rr-r2)+Math.abs(cc-c2))});
+          }
+          candidates.sort((x,y)=>x.priority-y.priority || x.dist-y.dist);
+          for (const q of candidates) {
+            if (targets.length>=3) break;
+            if (targets.some(t=>t[0]===q.r&&t[1]===q.c)) continue;
+            targets.push([q.r,q.c]);
+          }
+          while (targets.length<3) targets.push([Math.floor(Math.random()*ROWS),Math.floor(Math.random()*COLS)]);
+          const preview=cloneBoard(swapped);
+          preview[r1][c1]=null; preview[r2][c2]=null;
+          targets.forEach(([tr,tc])=>preview[tr][tc]=cell(a.t===null?0:a.t,"G"));
+          setBoard(preview);
+          setMessage("Triple Target Strike!");
+          await sleep(260);
+          seedArr=[];
+          targets.forEach(([tr,tc])=>seedArr.push(...areaCells("G",tr,tc)));
+        } else {
+          if (aIsSpecial) seedArr.push(...areaCells(a.p, r2, c2, comboRadius));
+          if (bIsSpecial) seedArr.push(...areaCells(b.p, r1, c1, comboRadius));
+        }
+      } else {
+        if (aIsSpecial) seedArr.push(...areaCells(a.p, r2, c2));
+        if (bIsSpecial) seedArr.push(...areaCells(b.p, r1, c1));
+      }
+
+      // The swap can ALSO form a genuine match shape beyond just triggering
+      // the specialty — if so, that match should still create its own new
+      // specialty gem instead of the blast erasing the opportunity.
+      const {
+        groups: matchGroups
+      } = analyzeBoard(swapped);
+      const newSpecials = {};
+      const swapHints = new Set([key(r1, c1), key(r2, c2)]);
+      matchGroups.forEach(g => {
+        if (g.power) {
+          let anchor = pickAnchor(g.cells, swapHints);
+          const [ar, ac] = anchor.split("-").map(Number);
+          if (swapped[ar] && swapped[ar][ac] && swapped[ar][ac].bonus === "oil") {
+            anchor = g.cells.find(k => {
+              const [rr, cc] = k.split("-").map(Number);
+              return swapped[rr] && swapped[rr][cc] && swapped[rr][cc].bonus !== "oil";
+            }) || anchor;
+          }
+          newSpecials[anchor] = {
+            t: g.type,
+            p: g.power
+          };
+        }
+        g.cells.forEach(k => seedArr.push(k));
+      });
+      const seed = new Set(seedArr);
+      let finalClear = expandClears(swapped, seed);
+      Object.keys(newSpecials).forEach(k => finalClear.delete(k)); // protect the new specialty's anchor cell
+      const resolved5 = processClear(swapped, finalClear);
+      markGrassTouched(resolved5.grassTouched);
+      const workingBoard5 = resolved5.board;
+      finalClear = resolved5.clearSet;
+      Object.keys(newSpecials).forEach(k => finalClear.delete(k)); // processClear may have re-added it via adjacency
+      illuminateCells(finalClear);
+      addProgress(tally(workingBoard5, finalClear));
+      addEffects(triggeredSpecials(workingBoard5, finalClear));
+      addSpecialtyProgress(triggeredSpecials(workingBoard5, finalClear));
+      const multiplier = bothSpecial ? 300 : 100;
+      addScore(finalClear.size * multiplier);
+      setMessage(bothSpecial ? "Combo x3!" : "Special triggered!");
+      const cleared = cloneBoard(workingBoard5);
+      finalClear.forEach(k => {
+        const [r, c] = k.split("-").map(Number);
+        cleared[r][c] = null;
+      });
+      Object.entries(newSpecials).forEach(([k, val]) => {
+        const [r, c] = k.split("-").map(Number);
+        cleared[r][c] = cell(val.t, val.p);
+      });
+      setBoard(cleared);
+      await sleep(125);
+      let current = settleBoard(cleared);
+      setBoard(current);
+      await sleep(170);
+      const groups2 = analyzeBoard(current).groups;
+      current = await clearAndScore(current, groups2, null);
+      setBusy(false);
+      await finishTurn(current);
+      return;
+    }
+    const {
+      groups
+    } = analyzeBoard(swapped);
+    if (groups.length === 0) {
+      setBusy(true);
+      setBoard(swapped);
+      setMessage("No match — try another pair");
+      resetHeat();
+      await sleep(125);
+      setBoard(board);
+      setBusy(false);
+      return;
+    }
+    setBusy(true);
+    setBoard(swapped);
+    decMoves(-1);
+    await sleep(95);
+    const finalBoard = await clearAndScore(swapped, groups, new Set([key(r1, c1), key(r2, c2)]));
+    setBusy(false);
+    await finishTurn(finalBoard);
+  }, [board, busy, status, clearAndScore, doubleRainbowClear, rainbowRandomClear, rainbowDuplicateEffect, finishTurn]);
+  const onSwipeStart = (r, c, e) => {
+    if (busy || status !== "playing") return;
+    swipeStartRef.current = { r, c, x: e.clientX, y: e.clientY, pointerId: e.pointerId };
+    suppressClickRef.current = false;
+    if (e.currentTarget && e.currentTarget.setPointerCapture) {
+      try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+    }
+  };
+  const onSwipeEnd = (r, c, e) => {
+    const start = swipeStartRef.current;
+    swipeStartRef.current = null;
+    if (!start || busy || status !== "playing") return;
+    const dx = e.clientX - start.x;
+    const dy = e.clientY - start.y;
+    const threshold = Math.max(10, cellSize * 0.24);
+    if (Math.max(Math.abs(dx), Math.abs(dy)) < threshold) return;
+    suppressClickRef.current = true;
+    const horizontal = Math.abs(dx) >= Math.abs(dy);
+    const nr = start.r + (horizontal ? 0 : dy > 0 ? 1 : -1);
+    const nc = start.c + (horizontal ? dx > 0 ? 1 : -1 : 0);
+    if (nr < 0 || nr >= ROWS || nc < 0 || nc >= COLS) return;
+    const from = board[start.r][start.c];
+    const to = board[nr][nc];
+    const fromLocked = from && from.obstacle && (from.obstacle.kind === "ice" || from.obstacle.kind === "wall");
+    const toLocked = to && to.obstacle && (to.obstacle.kind === "ice" || to.obstacle.kind === "wall");
+    if (fromLocked || toLocked) {
+      setMessage("That move is blocked!");
+      return;
+    }
+    setSelected(null);
+    trySwap(start.r, start.c, nr, nc);
+  };
+  const onCellClick = (r, c) => {
+    if (suppressClickRef.current) {
+      suppressClickRef.current = false;
+      return;
+    }
+    if (busy || status !== "playing") return;
+    const data = board[r][c];
+    const locked = data && data.obstacle && (data.obstacle.kind === "ice" || data.obstacle.kind === "wall");
+    if (!selected) {
+      if (locked) {
+        setMessage(data.obstacle.kind === "ice" ? "That gem is frozen solid!" : "A wall blocks that cell!");
+        return;
+      }
+      setSelected({
+        r,
+        c
+      });
+      return;
+    }
+    if (selected.r === r && selected.c === c) {
+      setSelected(null);
+      return;
+    }
+    if (locked) {
+      setMessage(data.obstacle.kind === "ice" ? "That gem is frozen solid!" : "A wall blocks that cell!");
+      setSelected(null);
+      return;
+    }
+    trySwap(selected.r, selected.c, r, c);
+  };
+  const activateSpecial = useCallback(async (r, c) => {
+    if (busy || status !== "playing") return;
+    const data = board[r][c];
+    if (!data || !data.p) return;
+    if (data.obstacle && (data.obstacle.kind === "ice" || data.obstacle.kind === "wall")) {
+      setMessage(data.obstacle.kind === "ice" ? "That gem is frozen solid!" : "A wall blocks that cell!");
+      return;
+    }
+    setSelected(null);
+    setBusy(true);
+    decMoves(-1);
+    heatMultRef.current = heatMultiplier(heatRef.current);
+    await sleep(85);
+    if (data.p === "R") {
+      const finalBoard = await rainbowRandomClear(board, key(r, c));
+      setBusy(false);
+      await finishTurn(finalBoard);
+      return;
+    }
+    if (data.p === "G") {
+      let target=grenadeTargetCell(board,r,c);
+      if (target && Math.abs(target[0]-r)<=1 && Math.abs(target[1]-c)<=1) {
+        // The first 3x3 would swallow this target; seek a visibly separate one.
+        let best=null, bestDist=Infinity;
+        for (let rr=0;rr<ROWS;rr++) for (let cc=0;cc<COLS;cc++) {
+          if (Math.abs(rr-r)<=1 && Math.abs(cc-c)<=1) continue;
+          const d=board[rr][cc];
+          if (!d) continue;
+          const useful=!!d.obstacle || (d.t!==null && d.t!==undefined);
+          if (!useful) continue;
+          const dist=Math.abs(rr-r)+Math.abs(cc-c);
+          if (dist<bestDist) {best=[rr,cc];bestDist=dist;}
+        }
+        if (best) target=best;
+      }
+      target=target || [r,c];
+      const [tr,tc]=target;
+
+      // First 3×3 blast at activation point.
+      let firstClear=expandClears(board,new Set([key(r,c),...areaCells("G",r,c)]));
+      const resolvedA=processClear(board,firstClear);
+      markGrassTouched(resolvedA.grassTouched);
+      let working=resolvedA.board;
+      firstClear=resolvedA.clearSet;
+      illuminateCells(firstClear);
+      addProgress(tally(working,firstClear));
+      addEffects([{r,c,power:"G"}]);
+      addSpecialtyProgress(triggeredSpecials(working,firstClear));
+      addScore(firstClear.size*100);
+
+      let jumped=cloneBoard(working);
+      firstClear.forEach(k=>{const [rr,cc]=k.split("-").map(Number);jumped[rr][cc]=null;});
+      if (tr>=0&&tr<ROWS&&tc>=0&&tc<COLS) jumped[tr][tc]=cell(data.t===null?0:data.t,"G");
+      setBoard(jumped);
+      setMessage("Grenade jump!");
+      await sleep(240); // visible travel beat before the target blast
+
+      // Same 3×3 blast at target.
+      let secondClear=expandClears(jumped,new Set([key(tr,tc),...areaCells("G",tr,tc)]));
+      const resolvedB=processClear(jumped,secondClear);
+      markGrassTouched(resolvedB.grassTouched);
+      working=resolvedB.board;
+      secondClear=resolvedB.clearSet;
+      illuminateCells(secondClear);
+      addProgress(tally(working,secondClear));
+      addEffects([{r:tr,c:tc,power:"G"}]);
+      addScore(secondClear.size*100);
+
+      const cleared=cloneBoard(working);
+      secondClear.forEach(k=>{const [rr,cc]=k.split("-").map(Number);cleared[rr][cc]=null;});
+      setBoard(cleared);
+      setMessage("Grenade — double 3×3 blast!");
+      await sleep(125);
+
+      let current=settleBoard(cleared);
+      setBoard(current);
+      await sleep(170);
+      const groups=analyzeBoard(current).groups;
+      current=await clearAndScore(current,groups,null);
+      setBusy(false);
+      await finishTurn(current);
+      return;
+    }
+    const seed = new Set([key(r, c), ...areaCells(data.p, r, c)]);
+    let finalClear = expandClears(board, seed);
+    const resolved6 = processClear(board, finalClear);
+      markGrassTouched(resolved6.grassTouched);
+    const workingBoard6 = resolved6.board;
+    finalClear = resolved6.clearSet;
+    illuminateCells(finalClear);
+    addProgress(tally(workingBoard6, finalClear));
+    addEffects(triggeredSpecials(workingBoard6, finalClear));
+    addSpecialtyProgress(triggeredSpecials(workingBoard6, finalClear));
+    addScore(finalClear.size * 100);
+    setMessage(data.p === "G" ? "Grenade!" : data.p === "T" ? "TNT!" : "Blast!");
+    const cleared = cloneBoard(workingBoard6);
+    finalClear.forEach(k => {
+      const [rr, cc] = k.split("-").map(Number);
+      cleared[rr][cc] = null;
+    });
+    setBoard(cleared);
+    await sleep(125);
+    let current = settleBoard(cleared);
+    setBoard(current);
+    await sleep(170);
+    const groups = analyzeBoard(current).groups;
+    current = await clearAndScore(current, groups, null);
+    setBusy(false);
+    await finishTurn(current);
+  }, [board, busy, status, clearAndScore, rainbowRandomClear, finishTurn]);
+  const startLevel = (lvl, carryIn, powerupsToPlace, forcedStartMoves = null, preserveRetry = false) => {
+    const carryApplies = lvl >= CARRY_START_LEVEL;
+    const cyclePosForStart = (lvl - 1) % DIFFICULTY_CYCLE_LENGTH + 1;
+    let colorRushType = null;
+    if (cyclePosForStart === 4) {
+      const choices = GEMS.map((_, i) => i).filter(i => i !== lastColorRushRef.current);
+      colorRushType = choices[Math.floor(Math.random() * choices.length)];
+      lastColorRushRef.current = colorRushType;
+    }
+    let newObjectives = generateObjectives(lvl, colorRushType);
+    const chapterTwists = chapterTwistsForLevel(lvl);
+    if (chapterTwists.includes("reverseFlow") &&
+        !newObjectives.some(o=>o.kind==="reverseFlow") &&
+        !newObjectives.some(o=>o.kind==="oilRush")) {
+      newObjectives=[...newObjectives,{kind:"reverseFlow",required:true}];
+    }
+    if (newObjectives.some(o=>o.kind==="oilRush")) {
+      newObjectives=newObjectives.filter(o=>o.kind!=="reverseFlow" && o.kind!=="gravityShift");
+    }
+    const weights = computeWeights(newObjectives);
+    let newBoard = makeBoard(weights);
+    const scarcityObjective = newObjectives.find(o => o.kind === "color" && o.exact);
+    const avoidCells = new Set();
+    if (scarcityObjective) {
+      newBoard = scatterExactColor(newBoard, scarcityObjective.type, scarcityObjective.required);
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (newBoard[r][c].t === scarcityObjective.type) avoidCells.add(key(r, c));
+    }
+    const obstaclePlans = pickObstaclesForLevel(lvl);
+    if (obstaclePlans.length) {
+      obstaclePlans.forEach(plan => {
+        newBoard = scatterObstacles(newBoard, plan.kind, plan.count, avoidCells);
+      });
+      obstaclePlans.forEach(plan => {
+        newObjectives.push({kind:"obstacle", obstacleKind:plan.kind, required:countObstacles(newBoard, plan.kind)});
+      });
+    }
+    const oilRushObjective = newObjectives.find(o => o.kind === "oilRush");
+    if (oilRushObjective) {
+      newBoard = scatterOilDrops(newBoard, oilRushObjective.required, avoidCells);
+    }
+    const totalPowerups = powerupsToPlace ? Object.values(powerupsToPlace).reduce((a, b) => a + b, 0) : 0;
+    if (totalPowerups > 0) {
+      const cells = [];
+      for (let r = 0; r < ROWS; r++) for (let c = 0; c < COLS; c++) if (!newBoard[r][c].bonus && !newBoard[r][c].obstacle) cells.push([r, c]);
+      for (let i = cells.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [cells[i], cells[j]] = [cells[j], cells[i]];
+      }
+      newBoard = cloneBoard(newBoard);
+      let cellIdx = 0;
+      const placeOne = power => {
+        if (cellIdx >= cells.length) return;
+        const [r, c] = cells[cellIdx++];
+        if (power === "arrow") {
+          newBoard[r][c] = {
+            ...newBoard[r][c],
+            p: Math.random() < 0.5 ? "H" : "V"
+          };
+        } else {
+          newBoard[r][c] = {
+            ...newBoard[r][c],
+            p: power
+          };
+        }
+      };
+      Object.entries(powerupsToPlace || {}).forEach(([power, count]) => {
+        for (let i = 0; i < count; i++) placeOne(power);
+      });
+    }
+    const timedObjective = newObjectives.find(o => o.kind === "timedColor");
+    const anyTimedObjective = newObjectives.find(o => o.kind === "timedColor" || (o.kind === "oilRush" && o.timeLimitSeconds));
+    const specialtyObjective = newObjectives.find(o => o.kind === "specialtyTrigger");
+    const starChallengeObjective = newObjectives.find(o => o.kind === "starChallenge");
+    const lightRunObjective = newObjectives.find(o => o.kind === "lightRun");
+    const reverseFlowObjective = newObjectives.find(o => o.kind === "reverseFlow");
+    const gravityShiftObjective = newObjectives.find(o => o.kind === "gravityShift");
+    const aftershockObjective = newObjectives.find(o => o.kind === "aftershock");
+    const allInObjective = newObjectives.find(o => o.kind === "allIn");
+    const legalCarry = carryApplies ? Math.min(10,Math.max(0,Number(carryIn||0))) : 0;
+    const rolledStartMoves = anyTimedObjective ? 200 : baseMovesForLevel(lvl) + legalCarry;
+    const startMoves = forcedStartMoves !== null ? forcedStartMoves : rolledStartMoves;
+    retryEntryRef.current={level:lvl,carry:legalCarry,startMoves,powerups:powerupsToPlace?{...powerupsToPlace}:null};
+    if (!preserveRetry) setRetryUsed(false);
+    setChapterPrompt(chapterPromptForLevel(lvl));
+    setLevel(lvl);
+    setObjectives(newObjectives);
+    setProgress(Array(GEMS.length).fill(0));
+    progressRef.current = Array(GEMS.length).fill(0);
+    setSpecialtyProgress({
+      arrow: 0,
+      G: 0,
+      T: 0,
+      R: 0
+    });
+    specialtyProgressRef.current = {
+      arrow: 0,
+      G: 0,
+      T: 0,
+      R: 0
+    };
+    comboProgressRef.current={AA:0,arrowT:0,arrowG:0,TT:0,GT:0,GG:0,RR:0,arrowR:0,TR:0,GR:0};
+    setComboProgress({AA:0,arrowT:0,arrowG:0,TT:0,GT:0,GG:0,RR:0,arrowR:0,TR:0,GR:0});
+    gravityChallengeMovesRef.current=0;
+    setGravityChallengeMoves(0);
+    setOilProgress(0);
+    oilProgressRef.current = 0;
+    const initialTime = anyTimedObjective ? anyTimedObjective.timeLimitSeconds : 0;
+    setTimeLeft(initialTime);
+    timeLeftRef.current = initialTime;
+    startingTimeRef.current = initialTime;
+    objectivesRef.current = newObjectives;
+    weightsRef.current = weights;
+    setBoard(newBoard);
+    setScore(0);
+    scoreRef.current = 0;
+    movesRef.current = startMoves;
+    startingMovesRef.current = startMoves;
+    setMoves(startMoves);
+    setLevelStars(0);
+    illuminatedRef.current = new Set();
+    setIlluminatedTiles(new Set());
+    setShowLightScripture(false);
+    setShowCarryExchange(false);
+    grassTouchedRef.current = new Set();
+    setSelected(null);
+    setExcessBalance(0);
+    setPowerupAllocation({
+      G: 0,
+      arrow: 0,
+      T: 0,
+      R: 0
+    });
+    setHeatPowerupSeed({
+      G: 0,
+      arrow: 0,
+      T: 0,
+      R: 0
+    });
+    setMessage(allInObjective ? "ALL-IN Rush — clear every quest on the board!" : gravityShiftObjective ? "Gravity Shift — complete the targets within 10 resolved moves!" : aftershockObjective ? "Aftershock — the quotas are heavier; keep the board moving!" : timedObjective ? `Rush! Clear ${timedObjective.required} of that color in ${Math.floor(timedObjective.timeLimitSeconds / 60)} minutes!` : oilRushObjective ? `Guide ${oilRushObjective.required} Oil Drops to the bottom in ${Math.floor(oilRushObjective.timeLimitSeconds / 60)} minutes!` : specialtyObjective ? `Trigger ${specialtyObjective.required} ${POWER_NAMES[specialtyObjective.power]} gems to clear this level!` : lightRunObjective ? "Light Rush — bring light to all 100 tiles!" : newObjectives.some(o => o.kind === "reverseFlow") ? "Reverse Flow — cleared spaces refill from the bottom and gems rise!" : starChallengeObjective ? "3-Star Challenge — finish while at least 35% of your moves remain!" : obstaclePlans.length ? obstaclePlans.length > 1 ? "Obstacle Quest — clear every Ice, Wall and Grass objective shown!" : obstaclePlans[0].kind === "ice" ? "Ice Quest — regular matches can crack every frozen tile!" : obstaclePlans[0].kind === "wall" ? "Wall Quest — only specialty gems can destroy the walls!" : "Grass Quest — clear grass twice in a row or it recovers and spreads!" : scarcityObjective ? `Only ${scarcityObjective.required} of that color exist this level — make them count!` : totalPowerups > 0 ? `${totalPowerups} traded-in power-up${totalPowerups > 1 ? "s" : ""} seeded on the board!` : carryApplies && carryIn > 0 ? `Moves carried over: +${carryIn}` : "Swap gems to match 3 or more");
+    setStatus("playing");
+    saveProgress(lvl, checkpointRef.current, heatRef.current);
+  };
+  const nextLevel = () => {
+    if (level >= MAX_LEVEL) return;
+    if (level % CHECKPOINT_INTERVAL === 0) {
+      setCheckpoint(level);
+      checkpointRef.current = level;
+    }
+    const combined = {
+      G: powerupAllocation.G + heatPowerupSeed.G,
+      arrow: powerupAllocation.arrow + heatPowerupSeed.arrow,
+      T: powerupAllocation.T + heatPowerupSeed.T,
+      R: powerupAllocation.R + heatPowerupSeed.R
+    };
+    const nextLevelNumber = level + 1;
+    startLevel(nextLevelNumber, carried, combined);
+  };
+  const prepareNextLevel = () => {
+    if (level >= MAX_LEVEL) return;
+    if (excessBalance > 0) {
+      setShowCarryExchange(true);
+      return;
+    }
+    nextLevel();
+  };
+  const retryLevel = () => {
+    resetHeat();
+    if (level >= 81 && !retryUsed) {
+      setRetryUsed(true);
+      const saved=retryEntryRef.current;
+      startLevel(level,saved.carry||0,saved.powerups||null,saved.startMoves,true);
+      return;
+    }
+    setRetryUsed(false);
+    const cp=checkpointFor(level);
+    setCheckpoint(cp);
+    checkpointRef.current=cp;
+    startLevel(cp,0,null);
+  };
+  const retryCurrentLevel = () => {
+    resetHeat();
+    startLevel(level, 0, null);
+  };
+  const restartGame = () => {
+    resetHeat();
+    const cp = status === "won" && level % CHECKPOINT_INTERVAL === 0 ? level : checkpointFor(level);
+    setCheckpoint(cp);
+    checkpointRef.current=cp;
+    startLevel(cp,0,null);
+  };
+  const restartFromEntry = () => {
+    try {
+      localStorage.removeItem(SAVE_KEY);
+    } catch (e) {}
+    const clearedStars = {};
+    bestStarsRef.current = clearedStars;
+    setBestStars(clearedStars);
+    resetHeat();
+    setCheckpoint(1);
+    checkpointRef.current = 1;
+    setHasSavedRun(false);
+    startLevel(1, 0, null);
+    setShowWelcome(false);
+  };
+  const spentBalance = powerupAllocation.G * POWERUP_COSTS.G + powerupAllocation.arrow * POWERUP_COSTS.arrow + powerupAllocation.T * POWERUP_COSTS.T + powerupAllocation.R * POWERUP_COSTS.R;
+  const remainingBalance = excessBalance - spentBalance;
+  const adjustAllocation = (kind, delta) => {
+    setPowerupAllocation(prev => {
+      const nextCount = prev[kind] + delta;
+      if (nextCount < 0) return prev;
+      const nextSpent = (kind === "G" ? nextCount : prev.G) * POWERUP_COSTS.G + (kind === "arrow" ? nextCount : prev.arrow) * POWERUP_COSTS.arrow + (kind === "T" ? nextCount : prev.T) * POWERUP_COSTS.T + (kind === "R" ? nextCount : prev.R) * POWERUP_COSTS.R;
+      if (nextSpent > excessBalance) return prev;
+      return {
+        ...prev,
+        [kind]: nextCount
+      };
+    });
+  };
+  const activeBonus = objectives.find(o => o.kind === "allIn" || o.kind === "aftershock" || o.kind === "gravityShift" || o.kind === "timedColor" || o.kind === "oilRush" || o.kind === "specialtyTrigger" || o.kind === "starChallenge" || o.kind === "lightRun" || o.kind === "reverseFlow");
+  const bonusTitle = activeBonus ? activeBonus.kind === "aftershock" ? "AFTERSHOCK" : activeBonus.kind === "gravityShift" ? "GRAVITY SHIFT" : activeBonus.kind === "timedColor" ? "COLOR RUSH" : activeBonus.kind === "oilRush" ? "OIL RUSH" : activeBonus.kind === "lightRun" ? "LIGHT RUSH" : activeBonus.kind === "allIn" ? "ALL-IN RUSH" : activeBonus.kind === "reverseFlow" ? "REVERSE FLOW" : activeBonus.kind === "starChallenge" ? "3-STAR RUSH" : "SPECIALTY GEM RUSH" : null;
+  const summaryRows = objectives.filter(o=>!["allIn","reverseFlow","gravityShift","aftershock","starChallenge"].includes(o.kind)).map(o=>{
+    if (o.kind==="color"||o.kind==="timedColor") return {label:`${GEM_NAMES[o.type]} Gems`,actual:progress[o.type]||0,required:o.required};
+    if (o.kind==="score") return {label:"Score",actual:score,required:o.required};
+    if (o.kind==="oilRush") return {label:"Oil Drops",actual:oilProgress,required:o.required};
+    if (o.kind==="lightRun") return {label:"Light",actual:illuminatedTiles.size,required:o.required};
+    if (o.kind==="obstacle") return {label:`${o.obstacleKind[0].toUpperCase()+o.obstacleKind.slice(1)} Left`,actual:countObstacles(board,o.obstacleKind),required:0,leftMode:true};
+    if (o.kind==="specialtyTrigger") {
+      const actual=o.power==="any"?Object.values(specialtyProgress).reduce((a,b)=>a+b,0):(specialtyProgress[specialtyBucket(o.power)]||0);
+      return {label:`${POWER_NAMES[o.power]} Activations`,actual,required:o.required};
+    }
+    if (o.kind==="specialtyCombo") {
+      const label=comboLabel(o.combo);
+      return {label,actual:comboProgress[o.combo]||0,required:o.required};
+    }
+    return null;
+  }).filter(Boolean);
+  const isCheckpointWin = status === "won" && level % CHECKPOINT_INTERVAL === 0;
+  const size = cellSize;
+  return /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: "100vh",
+      width: "100%",
+      boxSizing: "border-box",
+      overflowX: "hidden",
+      background: "radial-gradient(circle at 18% -5%, rgba(77,184,255,0.28) 0%, transparent 30%), radial-gradient(circle at 90% 8%, rgba(176,108,255,0.28) 0%, transparent 31%), radial-gradient(circle at 50% 100%, rgba(255,92,122,0.12) 0%, transparent 38%), linear-gradient(160deg,#17152a 0%,#101425 46%,#090b15 100%)",
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      padding: "22px 12px 40px",
+      fontFamily: "Inter, ui-rounded, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
+      color: "#F2EFE6"
+    }
+  }, chapterPrompt && /*#__PURE__*/React.createElement("div",{
+    style:{position:"fixed",inset:0,zIndex:120,display:"flex",alignItems:"center",justifyContent:"center",padding:18,background:"rgba(5,7,16,.91)",backdropFilter:"blur(10px)"}
+  }, /*#__PURE__*/React.createElement("div",{
+    style:{width:"100%",maxWidth:390,padding:"24px 20px",borderRadius:24,background:"linear-gradient(160deg,rgba(38,43,78,.995),rgba(14,17,36,.995))",border:"1px solid rgba(255,211,79,.5)",boxShadow:"0 28px 80px rgba(0,0,0,.7)",textAlign:"center"}
+  }, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,letterSpacing:3.5,color:"#ffd34f",fontWeight:900}},"NEW CHAPTER"),
+  /*#__PURE__*/React.createElement("div",{style:{fontSize:15,lineHeight:1.55,color:"#f2efe6",marginTop:12}},chapterPrompt),
+  /*#__PURE__*/React.createElement("button",{onClick:()=>setChapterPrompt(null),style:{...btnStyle,marginTop:18,width:"100%"}},"Continue"))), showCarryExchange && /*#__PURE__*/React.createElement(CarryExchangeModal, {
+    level: level,
+    balance: excessBalance,
+    allocation: powerupAllocation,
+    onAdjust: adjustAllocation,
+    onContinue: () => { setShowCarryExchange(false); nextLevel(); },
+    onCancel: () => setShowCarryExchange(false)
+  }), showLightScripture && /*#__PURE__*/React.createElement(LightScriptureModal, {
+    scripture: lightScriptureForLevel(level),
+    onContinue: () => setShowLightScripture(false)
+  }), showWelcome && /*#__PURE__*/React.createElement(WelcomeModal, {
+    onClose: dismissWelcome,
+    onRestart: restartFromEntry,
+    savedLevel: level,
+    hasSavedRun: hasSavedRun,
+    bestStars: bestStars
+  }), /*#__PURE__*/React.createElement(GemGradientDefs, null), /*#__PURE__*/React.createElement("style", null, `
+        .gem-cell{transition:transform 105ms cubic-bezier(.2,.8,.2,1),filter 120ms ease;will-change:transform;transform:translateZ(0);backface-visibility:hidden;contain:layout paint style}.gem-cell:hover{filter:brightness(1.08)}
+        .gem-cell:active{transform:scale(0.9)}
+        .special-pulse{animation:specialPulse 1.55s ease-in-out infinite;will-change:transform,opacity;transform:translateZ(0)}
+        .bonus-banner{animation:bonusEnter 480ms cubic-bezier(.2,.9,.2,1) both}
+        .light-scripture{animation:lightReveal 520ms cubic-bezier(.18,.88,.25,1) both}
+        @keyframes lightReveal{0%{opacity:0;transform:scale(.92);filter:brightness(.6)}65%{opacity:1;transform:scale(1.025);filter:brightness(1.18)}100%{transform:scale(1);filter:brightness(1)}}
+        @keyframes bonusEnter{0%{opacity:0;transform:translateY(-8px) scale(.96)}100%{opacity:1;transform:translateY(0) scale(1)}}
+        .win-burst{animation:winBurst 650ms cubic-bezier(.15,.85,.25,1) both}
+        @keyframes winBurst{0%{opacity:0;transform:scale(.72) rotate(-4deg)}60%{opacity:1;transform:scale(1.06) rotate(1deg)}100%{transform:scale(1) rotate(0)}}
+        @keyframes specialPulse{
+          0%,100%{ transform: scale(1); opacity: 1; }
+          50%{ transform: scale(1.10); opacity: 0.92; filter:brightness(1.16); }
+        }
+        .fx-beam{ animation: fxBeam 450ms ease-out forwards; transform-origin: left center; }
+        @keyframes fxBeam{
+          0%{ opacity:0; transform: scaleX(0.1); }
+          40%{ opacity:1; transform: scaleX(1); }
+          100%{ opacity:0; transform: scaleX(1); }
+        }
+        .fx-beam-v{ animation: fxBeamV 450ms ease-out forwards; transform-origin: center top; }
+        @keyframes fxBeamV{
+          0%{ opacity:0; transform: scaleY(0.1); }
+          40%{ opacity:1; transform: scaleY(1); }
+          100%{ opacity:0; transform: scaleY(1); }
+        }
+        .fx-grenade{ animation: fxPop 500ms ease-out forwards; }
+        .fx-tnt{ animation: fxPop 600ms ease-out forwards; }
+        @keyframes fxPop{
+          0%{ opacity:0; transform: scale(0.15); }
+          35%{ opacity:1; }
+          100%{ opacity:0; transform: scale(1); }
+        }
+        .fx-rainbow{ animation: fxRainbow 600ms ease-out forwards; }
+        @keyframes fxRainbow{
+          0%{ opacity:0; transform: scale(0.2) rotate(0deg); }
+          40%{ opacity:0.8; }
+          100%{ opacity:0; transform: scale(1) rotate(120deg); }
+        }
+      `), /*#__PURE__*/React.createElement("div", {
+    style: {
+      textAlign: "center",
+      marginBottom: 10,
+      position: "relative",
+      width: "100%"
+    }
+  }, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 10,
+      letterSpacing: 5,
+      textTransform: "uppercase",
+      color: "#ffd34f"
+    }
+  }, "Level ", level), /*#__PURE__*/React.createElement("h1", {
+    style: {
+      margin: "2px 0 0",
+      fontSize: 30,
+      fontWeight: 900,
+      letterSpacing: -0.8,
+      color: "#ffffff",
+      textShadow: "0 2px 0 rgba(255,255,255,0.08), 0 0 22px rgba(176,108,255,0.38)"
+    }
+  }, "Diamond Run"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => setShowWelcome(true),
+    "aria-label": "How to play",
+    style: {
+      position: "absolute",
+      top: 0,
+      right: 0,
+      width: 26,
+      height: 26,
+      borderRadius: "50%",
+      border: "1px solid rgba(255,211,79,0.5)",
+      background: "rgba(255,255,255,0.06)",
+      color: "#ffd34f",
+      fontSize: 13,
+      fontWeight: 700,
+      cursor: "pointer",
+      fontFamily: "inherit"
+    }
+  }, "?")), status === "playing" && activeBonus && /*#__PURE__*/React.createElement("div", {
+    className: "bonus-banner",
+    style: { width:"100%", maxWidth:420, boxSizing:"border-box", margin:"2px 0 10px", padding:"9px 12px", borderRadius:14, textAlign:"center", background:"linear-gradient(135deg,rgba(255,211,79,.18),rgba(176,108,255,.18))", border:"1px solid rgba(255,211,79,.42)", boxShadow:"0 8px 24px rgba(0,0,0,.18)" }
+  }, /*#__PURE__*/React.createElement("div", {style:{fontSize:10,letterSpacing:3.2,fontWeight:900,color:"#ffd34f"}}, bonusTitle)), status === "playing" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 16,
+      marginBottom: 10,
+      fontSize: 14,
+      flexWrap: "wrap",
+      justifyContent: "center",
+      maxWidth: "100%"
+    }
+  }, /*#__PURE__*/React.createElement(Stat, {
+    label: "Score",
+    value: score
+  }), objectives.some(o => o.kind === "timedColor" || (o.kind === "oilRush" && o.timeLimitSeconds)) ? /*#__PURE__*/React.createElement(Stat, {
+    label: "Time",
+    value: `${Math.floor(timeLeft / 60)}:${String(timeLeft % 60).padStart(2, "0")}`,
+    accent: timeLeft <= 20 ? "#ff5c7a" : undefined
+  }) : /*#__PURE__*/React.createElement(Stat, {
+    label: "Moves",
+    value: moves,
+    accent: moves <= 5 ? "#ff5c7a" : undefined
+  }), heat > 0 && /*#__PURE__*/React.createElement(Stat, {
+    label: "Heat",
+    value: `${heat} (${heatMultiplier(heat)}×)`,
+    accent: heat >= 10 ? "#ff5c7a" : heat >= 3 ? "#ffd34f" : undefined
+  })), status === "playing" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      display: "flex",
+      gap: 8,
+      marginBottom: 8,
+      flexWrap: "wrap",
+      justifyContent: "center",
+      maxWidth: "100%"
+    }
+  }, objectives.filter(o => !["reverseFlow","gravityShift","aftershock","allIn"].includes(o.kind)).map((o, i) => /*#__PURE__*/React.createElement(ObjectiveBadge, {
+    key: o.kind === "score" ? "score" : o.kind === "specialtyCombo" ? `combo-${o.combo}` : o.kind === "specialtyTrigger" ? `spec-${o.power}` : o.kind === "oilRush" ? "oilRush" : o.kind === "lightRun" ? "lightRun" : o.kind === "obstacle" ? `obstacle-${o.obstacleKind}` : `color-${o.type}-${i}`,
+    objective: o,
+    progress: o.kind === "color" || o.kind === "timedColor" ? progress[o.type] : undefined,
+    score: score,
+    oilProgress: o.kind === "oilRush" ? oilProgress : undefined,
+    specialtyCount: o.kind === "specialtyTrigger" ? (o.power === "any" ? Object.values(specialtyProgress).reduce((a,b)=>a+b,0) : specialtyProgress[specialtyBucket(o.power)] || 0) : o.kind === "specialtyCombo" ? comboProgress[o.combo] || 0 : undefined,
+    lightProgress: o.kind === "lightRun" ? illuminatedTiles.size : undefined,
+    obstacleRemaining: o.kind === "obstacle" ? countObstacles(board, o.obstacleKind) : undefined
+  }))), status === "playing" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      minHeight: 18,
+      marginBottom: 10,
+      padding: "5px 10px",
+      borderRadius: 999,
+      fontSize: 12.5,
+      color: "#d9d7ef",
+      background: "rgba(255,255,255,0.045)",
+      border: "1px solid rgba(255,255,255,0.07)",
+      fontStyle: "normal"
+    }
+  }, message), /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "relative",
+      display: "grid",
+      gridTemplateColumns: `repeat(${COLS}, ${size}px)`,
+      gridTemplateRows: `repeat(${ROWS}, ${size}px)`,
+      gap: GRID_GAP,
+      padding: GRID_PAD,
+      background: activeBonus && (activeBonus.kind === "lightRun" || activeBonus.kind === "allIn") && illuminatedTiles.size >= ROWS * COLS ? "radial-gradient(circle at 50% 35%, rgba(255,234,150,.30), rgba(176,108,255,.12) 48%, rgba(12,14,30,.96) 100%)" : "radial-gradient(circle at 50% 0%, rgba(176,108,255,0.14), transparent 42%), linear-gradient(155deg, rgba(28,31,65,0.92), rgba(12,14,30,0.96))",
+      border: activeBonus ? "1px solid rgba(255,211,79,.62)" : "1px solid rgba(255,211,79,0.34)",
+      borderRadius: 18,
+      boxShadow: activeBonus ? "inset 0 1px 0 rgba(255,255,255,.16), inset 0 -14px 30px rgba(0,0,0,.18), 0 22px 65px rgba(0,0,0,.54), 0 0 42px rgba(255,211,79,.18)" : "inset 0 1px 0 rgba(255,255,255,0.11), inset 0 -14px 30px rgba(0,0,0,0.18), 0 22px 65px rgba(0,0,0,0.54), 0 0 34px rgba(176,108,255,0.10)"
+    }
+  }, board.map((row, r) => row.map((data, c) => /*#__PURE__*/React.createElement(CellView, {
+    key: key(r, c),
+    data: data,
+    size: size,
+    selected: selected && selected.r === r && selected.c === c,
+    onClick: () => onCellClick(r, c),
+    onDoubleClick: () => activateSpecial(r, c),
+    onPointerDown: e => onSwipeStart(r, c, e),
+    onPointerUp: e => onSwipeEnd(r, c, e),
+    lightRunActive: !!(activeBonus && (activeBonus.kind === "lightRun" || activeBonus.kind === "allIn")),
+    illuminated: illuminatedTiles.has(key(r, c)),
+    lightDarkness: Math.min(.98,.84 + Math.floor((level-1)/20)*.035)
+  }))), /*#__PURE__*/React.createElement(EffectsLayer, {
+    effects: effects,
+    size: size
+  }), status !== "playing" && /*#__PURE__*/React.createElement("div", {
+    style: {
+      position: "absolute",
+      top: 0,
+      left: 0,
+      right: 0,
+      bottom: status === "won" ? "auto" : 0,
+      minHeight: "100%",
+      height: status === "won" ? "auto" : "100%",
+      background: status === "won" ? "radial-gradient(circle at 50% 42%,rgba(176,108,255,.28),transparent 40%),rgba(7,8,18,.94)" : "rgba(10,11,18,0.94)",
+      border: status === "won" ? "1px solid rgba(255,211,79,.78)" : "none",
+      borderRadius: 12,
+      display: "flex",
+      flexDirection: "column",
+      alignItems: "center",
+      justifyContent: status === "won" ? "flex-start" : "center",
+      gap: 11,
+      textAlign: "center",
+      padding: status === "won" ? "20px 18px 24px" : 18,
+      boxSizing: "border-box",
+      backdropFilter: "blur(8px)"
+    }
+  }, status === "won" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    className: "win-burst",
+    style: {width:84,height:84,minWidth:84,minHeight:84,aspectRatio:"1 / 1",flexShrink:0,borderRadius:"50%",display:"flex",alignItems:"center",justifyContent:"center",fontSize:38,margin:"2px 0 3px",background:"conic-gradient(#ff5c7a,#ffd34f,#6fe28d,#4db8ff,#b06cff,#ff5c7a)",border:"3px solid white",boxShadow:"0 0 36px rgba(176,108,255,.65),inset 0 0 14px rgba(255,255,255,.7)"}
+  }, "◆"), /*#__PURE__*/React.createElement("div", {
+    style: {fontSize:10,letterSpacing:4,textTransform:"uppercase",color:isCheckpointWin?"#6fe28d":"#ffd34f",fontWeight:900}
+  }, isCheckpointWin ? "Checkpoint Secured" : activeBonus ? `${bonusTitle} Complete` : "Level Complete"), /*#__PURE__*/React.createElement("div", {
+    style: {fontSize:27,fontWeight:950,color:"#fff",letterSpacing:-.6,textShadow:"0 0 20px rgba(176,108,255,.45)"}
+  }, "Level ", level), /*#__PURE__*/React.createElement("div", {
+    style: {fontSize:13,padding:"7px 12px",borderRadius:999,background:"rgba(255,255,255,.07)",border:"1px solid rgba(255,255,255,.10)"}
+  }, "Final score  ", /*#__PURE__*/React.createElement("strong", {style:{color:"#ffd34f"}}, score.toLocaleString())), /*#__PURE__*/React.createElement("div", {
+    style:{width:"100%",maxWidth:320,padding:"9px 12px",borderRadius:12,background:"rgba(255,255,255,.055)",border:"1px solid rgba(255,255,255,.08)",fontSize:11.5,lineHeight:1.3,boxSizing:"border-box"}
+  }, /*#__PURE__*/React.createElement("div",{style:{fontSize:10,letterSpacing:2.5,fontWeight:950,color:"#ffd34f",marginBottom:4}},"SUMMARY"),
+  summaryRows.map((row,i)=>/*#__PURE__*/React.createElement("div",{key:i,style:{display:"flex",justifyContent:"space-between",gap:12,padding:"2px 0"}},
+    /*#__PURE__*/React.createElement("span",null,row.label),
+    /*#__PURE__*/React.createElement("strong",null,row.leftMode?`${row.actual} left`:`${Number(row.actual||0).toLocaleString()} / ${Number(row.required||0).toLocaleString()}`)
+  ))), /*#__PURE__*/React.createElement("div", {
+    className: "win-burst",
+    style: {display:"flex",gap:8,fontSize:34,letterSpacing:2,margin:"8px 0 5px"}
+  }, [1,2,3].map(star => /*#__PURE__*/React.createElement("span", {
+    key: star,
+    style: {
+      color: star <= levelStars ? "#ffd34f" : "rgba(255,255,255,.16)",
+      textShadow: star <= levelStars ? "0 0 16px rgba(255,211,79,.75)" : "none"
+    }
+  }, "★"))), /*#__PURE__*/React.createElement("div", {
+    style:{fontSize:12,color:"#b6b3d8",marginBottom:2}
+  }, "Best: ", "★".repeat(bestStars[level] || levelStars), "☆".repeat(3 - (bestStars[level] || levelStars))), level + 1 >= CARRY_START_LEVEL && carried > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: "#B9B6AC"
+    }
+  }, carried, " moves carry into level ", level + 1), heatPowerupSeed.G + heatPowerupSeed.arrow + heatPowerupSeed.T + heatPowerupSeed.R > 0 && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: "#ffd34f"
+    }
+  }, "Heat streak earned ", heatPowerupSeed.G + heatPowerupSeed.arrow + heatPowerupSeed.T + heatPowerupSeed.R, " power-up", heatPowerupSeed.G + heatPowerupSeed.arrow + heatPowerupSeed.T + heatPowerupSeed.R > 1 ? "s" : "", " for the next board", heat > 0 && ` (${heat} heat still carrying)`), /*#__PURE__*/React.createElement("div", {
+    style:{display:"flex",gap:12,flexWrap:"wrap",justifyContent:"center",marginTop:8,width:"100%"}
+  }, /*#__PURE__*/React.createElement("button", {
+    onClick: retryCurrentLevel,
+    style: {...btnStyle,background:"rgba(255,255,255,.06)"}
+  }, levelStars < 3 ? "Retry for more stars" : "Replay level"), level < MAX_LEVEL ? /*#__PURE__*/React.createElement("button", {
+    onClick: prepareNextLevel,
+    style: btnStyle
+  }, "Next level") : /*#__PURE__*/React.createElement("div", {style:{fontSize:14,fontWeight:900,color:"#ffd34f",padding:"10px 14px"}}, "200 LEVELS COMPLETE")), /*#__PURE__*/React.createElement("button", {
+    onClick: restartGame,
+    style: {
+      ...btnStyle,
+      marginTop: 22,
+      marginBottom: 4,
+      fontSize: 12,
+      opacity: 0.78,
+      flexShrink: 0,
+      alignSelf: "center"
+    }
+  }, `Restart from level ${status === "won" && level % CHECKPOINT_INTERVAL === 0 ? level : checkpointFor(level)}`)) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 19,
+      color: "#ff5c7a"
+    }
+  }, status === "starfail" ? "3 Stars Required" : level >= 81 && !retryUsed ? "Retry Available" : "Out of moves"), status === "starfail" && /*#__PURE__*/React.createElement("div", {
+    style:{display:"flex",gap:8,fontSize:30,color:"#ffd34f"}
+  }, [1,2,3].map(star => /*#__PURE__*/React.createElement("span", {
+    key:star,
+    style:{opacity:star <= levelStars ? 1 : .2}
+  }, "★"))), /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 13
+    }
+  }, status === "starfail" ? `You earned ${levelStars} star${levelStars === 1 ? "" : "s"}. Finish earlier to earn all 3.` : level >= 81 && !retryUsed ? `One retry remains for Level ${level}.` : `Score ${score}`), status !== "starfail" && checkpoint < level && /*#__PURE__*/React.createElement("div", {
+    style: {
+      fontSize: 12.5,
+      color: "#B9B6AC"
+    }
+  }, "Sends you back to level ", checkpoint), /*#__PURE__*/React.createElement("button", {
+    onClick: status === "starfail" && level < 81 ? retryCurrentLevel : retryLevel,
+    style: btnStyle
+  }, status === "starfail" && level < 81 ? "Retry 3-Star Challenge" : level >= 81 && !retryUsed ? (status === "starfail" ? "Retry 3-Star Challenge · 1 attempt remaining" : "Retry level · 1 attempt remaining") : `Return to level ${checkpointFor(level)}`)))));
+}
+const btnStyle = {
+  padding: "11px 22px",
+  borderRadius: 999,
+  border: "1px solid rgba(255,255,255,.55)",
+  background: "linear-gradient(135deg,rgba(255,211,79,.22),rgba(176,108,255,.22))",
+  color: "#fff",
+  fontSize: 14,
+  cursor: "pointer",
+  fontFamily: "inherit"
+};
+const allocBtnStyle = {
+  width: 20,
+  height: 20,
+  borderRadius: 5,
+  border: "1px solid rgba(217,164,65,0.5)",
+  background: "rgba(217,164,65,0.1)",
+  color: "#ffd34f",
+  fontSize: 13,
+  lineHeight: "18px",
+  cursor: "pointer",
+  fontFamily: "inherit"
+};
+const __diamondRunRoot = document.getElementById("diamond-run-root");
+if (__diamondRunRoot && window.ReactDOM && window.ReactDOM.createRoot) {
+  ReactDOM.createRoot(__diamondRunRoot).render(React.createElement(Match3));
+}
+</script>
+</body>
+</html>
